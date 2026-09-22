@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "PAAUDIO PAA-100 for YouTube Music",
+  "version": "1.0.0",
+  "permissions": ["storage"],
+  "host_permissions": ["*://music.youtube.com/*"],
+  "content_scripts": [{
+    "matches": ["*://music.youtube.com/*"],
+    "js": ["content.js"],
+    "run_at": "document_idle"
+  }],
+  "web_accessible_resources": [{
+    "resources": ["bridge.js"],
+    "matches": ["*://music.youtube.com/*"]
+  }]
+}
