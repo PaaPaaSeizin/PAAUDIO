@@ -317,11 +317,11 @@
 
       <div class="rowControl">
         <div class="dpad">
-          <button class="k arrow" data-k="UP">▲<span class="sm">↑</span></button>
-          <button class="k arrow" data-k="LEFT">◀<span class="sm">←</span></button>
-          <button class="k arrow" data-k="DOWN">▼<span class="sm">↓</span></button>
-          <button class="k arrow" data-k="RIGHT">▶<span class="sm">→</span></button>
-        </div>
+  <button class="k arrow" data-k="UP">▲&#xFE0E;<span class="sm">↑&#xFE0E;</span></button>
+  <button class="k arrow" data-k="LEFT">◀&#xFE0E;<span class="sm">←&#xFE0E;</span></button>
+  <button class="k arrow" data-k="DOWN">▼&#xFE0E;<span class="sm">↓&#xFE0E;</span></button>
+  <button class="k arrow" data-k="RIGHT">▶&#xFE0E;<span class="sm">→&#xFE0E;</span></button>
+</div>
         <div class="rowControlRight">
           <button class="k enter" data-k="ENTER">ENTER<span class="sm">RET</span></button>
           <button class="k back" data-k="BACK">BACK<span class="sm">ESC</span></button>
@@ -901,6 +901,29 @@ const state = {
   playQueue: [],        // 再生キュー（空 = プレイリスト順）
   playQueueLabel: '',   // キュー元のグループ名（アーティスト名/アルバム名）
   confirmDialog: null,  // 確認ダイアログ（null = 非表示）
+  // ---- ソース切替リングセレクタ ----
+  selT: 0,              // リング表示残り時間（秒）
+  selOffset: 0,         // 現在のリング角度（実数）
+  selTarget: 0,         // 目標角度（整数）
+  // ---- OEL TEST ----
+  testPhase: 0,
+  testT: 0,
+  // ---- SERVICE MODE ----
+  versionTaps: 0,
+  lastTapT: 0,
+  customScreen: null,      // プラグイン画面 { id, draw(f), onKey(k) }
+  enginePlugins: [],       // [{ id, name, version, items, dispose }]
+  spkTestIdx: 0,
+  spkTestT: 0,
+  sigIdx: 0,
+  sigLR: 2,                // 0=L 1=R 2=BOTH
+  dumpScroll: 0,
+  eepromScroll: 0,
+  stubName: '',
+  stubT: 0,
+  // ---- SERVICE TEST ----
+  svcId: null,        // 実行中のサービス系テストID
+  diagStep: 0,        // 自己診断の進行
 };
 
 const SF_MODES = ['NORMAL','HALL','STADIUM','THEATER','CLUB','DISCO','LIVE','OFF'];
@@ -1128,6 +1151,34 @@ function decodePictureFrame(buf, start, end){
   const imgData = buf.slice(pos, end);
   return { mime, data: imgData };
 }
+
+/* ID3v2.2 の PIC フレーム（3文字の画像形式 + 1バイト種別 + 説明 + 画像） */
+function decodePictureFrameV22(buf, start, end){
+  if(end-start < 6) return null;
+  const enc = buf[start];
+  let pos = start + 1;
+  // image format: 3 ASCII chars ("JPG" / "PNG" / "BMP" など)
+  if(pos + 3 > end) return null;
+  let fmt = String.fromCharCode(buf[pos],buf[pos+1],buf[pos+2]).toUpperCase();
+  pos += 3;
+  let mime = 'image/jpeg';
+  if(fmt === 'PNG') mime = 'image/png';
+  else if(fmt === 'BMP') mime = 'image/bmp';
+  else if(fmt === 'GIF') mime = 'image/gif';
+  if(pos >= end) return null;
+  const picType = buf[pos]; pos++;
+  // description null-terminated
+  if(enc === 1 || enc === 2){
+    while(pos+1 < end && !(buf[pos]===0 && buf[pos+1]===0)) pos += 2;
+    pos += 2;
+  } else {
+    while(pos < end && buf[pos] !== 0) pos++;
+    pos++;
+  }
+  if(pos >= end) return null;
+  const imgData = buf.slice(pos, end);
+  return { mime, data: imgData };
+}
 /* 形式を判定して振り分け */
 async function parseID3(file){
   const empty = { title:null, artist:null, album:null, picture:null };
@@ -1138,6 +1189,8 @@ async function parseID3(file){
     if(head[0]===0x49 && head[1]===0x44 && head[2]===0x33) return parseID3v2(file);
     // FLAC
     if(head[0]===0x66 && head[1]===0x4C && head[2]===0x61 && head[3]===0x43) return parseFlac(file);
+    // OGG (Vorbis / Opus)
+    if(head[0]===0x4F && head[1]===0x67 && head[2]===0x67 && head[3]===0x53) return parseOgg(file);
     // MP4 / M4A
     if(head[4]===0x66 && head[5]===0x74 && head[6]===0x79 && head[7]===0x70) return parseM4A(file);
     // WAV (RIFF)
@@ -1173,7 +1226,121 @@ async function parseWAV(file){
   }catch(e){}
   return result;
 }
+/* ---------- OGG（Vorbis Comment / OpusTags） ---------- */
+/* OGG ページを走査してメタデータパケット（OpusTags / Vorbis comment）を再構成する。
+   ※大きなカバー画像はパケットが複数ページにまたがるため、
+      バッファ内を単純検索するとページヘッダが混入して壊れる。 */
+function findOggMetadataPacket(buf){
+  let p = 0;
+  let currentPacket = [];
+  let pageCount = 0;
+  while(p + 27 <= buf.length && pageCount < 64){
+    if(buf[p] !== 0x4F || buf[p+1] !== 0x67 || buf[p+2] !== 0x67 || buf[p+3] !== 0x53) break;
+    const headerType = buf[p+5];
+    const pageSegs   = buf[p+26];
+    const segTable   = p + 27;
+    let   dataOff    = segTable + pageSegs;
+    if(dataOff > buf.length) break;
 
+    const continued = (headerType & 0x01) !== 0;
+    if(!continued) currentPacket = [];
+
+    let segPos = segTable;
+    while(segPos < segTable + pageSegs){
+      const segSize = buf[segPos];
+      for(let i=0;i<segSize;i++){
+        if(dataOff + i < buf.length) currentPacket.push(buf[dataOff + i]);
+      }
+      dataOff += segSize;
+      segPos++;
+      if(segSize < 255){
+        // パケット終端
+        const pkt = new Uint8Array(currentPacket);
+        // OpusTags
+        if(pkt.length >= 8 &&
+           pkt[0]===0x4F && pkt[1]===0x70 && pkt[2]===0x75 && pkt[3]===0x73 &&
+           pkt[4]===0x54 && pkt[5]===0x61 && pkt[6]===0x67 && pkt[7]===0x73){
+          return { tags: pkt, hdrLen: 8 };
+        }
+        // Vorbis comment header (0x03 + "vorbis")
+        if(pkt.length >= 7 &&
+           pkt[0]===0x03 && pkt[1]===0x76 && pkt[2]===0x6F && pkt[3]===0x72 &&
+           pkt[4]===0x62 && pkt[5]===0x69 && pkt[6]===0x73){
+          return { tags: pkt, hdrLen: 7 };
+        }
+        currentPacket = [];
+      }
+    }
+    p = dataOff;
+    pageCount++;
+  }
+  return null;
+}
+
+async function parseOgg(file){
+  const result = { title:null, artist:null, album:null, picture:null };
+  try{
+    // ページ再構成で断片化されるため、余裕を持って 8MB まで読む
+    const cap = Math.min(file.size, 8 * 1024 * 1024);
+    const buf = await readSlice(file, 0, cap);
+
+    const found = findOggMetadataPacket(buf);
+    if(!found) return result;
+    const tags = found.tags;
+    let p = found.hdrLen;
+
+    const dv = new DataView(tags.buffer, tags.byteOffset, tags.byteLength);
+    if(p + 4 > tags.length) return result;
+    const vlen = dv.getUint32(p, true); p += 4;
+    p += vlen;                                  // vendor string
+    if(p + 4 > tags.length) return result;
+    const count = dv.getUint32(p, true); p += 4;
+    const dec = new TextDecoder('utf-8');
+    let coverartMime = null;
+    for(let i=0;i<count && p+4 <= tags.length;i++){
+      const len = dv.getUint32(p, true); p += 4;
+      if(len <= 0 || p+len > tags.length) break;
+      const s = dec.decode(tags.subarray(p, p+len));
+      p += len;
+      const eq = s.indexOf('=');
+      if(eq < 0) continue;
+      const key = s.slice(0, eq).toUpperCase();
+      const val = s.slice(eq+1).trim();
+      if(!val) continue;
+      if(key === 'TITLE' && !result.title) result.title = val;
+      else if(key === 'ARTIST' && !result.artist) result.artist = val;
+      else if(key === 'ALBUM' && !result.album) result.album = val;
+      else if(key === 'METADATA_BLOCK_PICTURE' && !result.picture){
+        try{
+          const clean = val.replace(/\s+/g, '');
+          const raw = atob(clean);
+          const bin = new Uint8Array(raw.length);
+          for(let j=0;j<raw.length;j++) bin[j] = raw.charCodeAt(j);
+          const pic = parseFlacPicture(bin);
+          if(pic) result.picture = pic;
+        }catch(e){}
+      }
+      else if(key === 'COVERART' && !result.picture){
+        // 旧形式（非推奨だが一部エンコーダが出力）
+        try{
+          const clean = val.replace(/\s+/g, '');
+          const raw = atob(clean);
+          const bin = new Uint8Array(raw.length);
+          for(let j=0;j<raw.length;j++) bin[j] = raw.charCodeAt(j);
+          result.picture = { mime: detectImageMime(bin, 'image/jpeg'), data: bin };
+        }catch(e){}
+      }
+      else if(key === 'COVERARTMIME'){
+        coverartMime = val;
+      }
+    }
+    // COVERART 使用時に MIME を補正
+    if(result.picture && coverartMime){
+      result.picture.mime = detectImageMime(result.picture.data, coverartMime);
+    }
+  }catch(e){}
+  return result;
+}
 /* バッファから直接 ID3v2 を解析（ファイル全体が渡される場合とチャンク先頭が渡される場合に対応） */
 function parseID3v2Buffer(buf, result){
   try{
@@ -1221,26 +1388,41 @@ async function parseID3v2(file){
     const tag = await readSlice(file, 10, 10+cap);
     let pos = 0;
     if(flags & 0x40){ // extended header
-      if(version === 4) pos += 6;
-      else pos += 10;
+      if(version === 4){
+        // v2.4: synchsafe size that includes the size field itself
+        const extSize = (tag[pos]&0x7f)<<21 | (tag[pos+1]&0x7f)<<14 |
+                        (tag[pos+2]&0x7f)<<7  | (tag[pos+3]&0x7f);
+        pos += Math.max(6, extSize);
+      } else {
+        // v2.3: 4-byte size NOT including the size field itself (6 or 10)
+        const extSize = (tag[pos]<<24)|(tag[pos+1]<<16)|(tag[pos+2]<<8)|tag[pos+3];
+        pos += 4 + extSize;
+      }
     }
     let guard = 0;
-    while(pos + 10 <= tag.length && guard++ < 2000){
-      const id = String.fromCharCode(tag[pos],tag[pos+1],tag[pos+2],tag[pos+3]);
-      if(!/^[A-Z0-9]{4}$/.test(id)) break;
+    const hdrLen = (version === 2) ? 6 : 10;
+    while(pos + hdrLen <= tag.length && guard++ < 2000){
+      const id = (version === 2)
+        ? String.fromCharCode(tag[pos],tag[pos+1],tag[pos+2])
+        : String.fromCharCode(tag[pos],tag[pos+1],tag[pos+2],tag[pos+3]);
+      const idRe = (version === 2) ? /^[A-Z0-9]{3}$/ : /^[A-Z0-9]{4}$/;
+      if(!idRe.test(id)) break;
       let fsize;
       if(version === 4){
         fsize = (tag[pos+4]&0x7f)<<21 | (tag[pos+5]&0x7f)<<14 | (tag[pos+6]&0x7f)<<7 | (tag[pos+7]&0x7f);
+      } else if(version === 2){
+        fsize = (tag[pos+3]<<16) | (tag[pos+4]<<8) | tag[pos+5];
       } else {
         fsize = (tag[pos+4]<<24) | (tag[pos+5]<<16) | (tag[pos+6]<<8) | tag[pos+7];
       }
-      if(fsize <= 0 || pos+10+fsize > tag.length) break;
-      const ds = pos+10, de = ds+fsize;
+      if(fsize <= 0 || pos+hdrLen+fsize > tag.length) break;
+      const ds = pos+hdrLen, de = ds+fsize;
       try{
         if(id === 'TIT2' || id === 'TT2') result.title = decodeTextFrame(tag, ds, de);
         else if(id === 'TPE1' || id === 'TP1') result.artist = decodeTextFrame(tag, ds, de);
         else if(id === 'TALB' || id === 'TAL') result.album = decodeTextFrame(tag, ds, de);
-        else if(id === 'APIC' || id === 'PIC') result.picture = decodePictureFrame(tag, ds, de);
+        else if(id === 'APIC') result.picture = decodePictureFrame(tag, ds, de);
+        else if(id === 'PIC')  result.picture = decodePictureFrameV22(tag, ds, de);
       }catch(e){}
       pos = de;
     }
@@ -1265,7 +1447,7 @@ async function parseFlac(file){
         const buf = await readSlice(file, ds, ds + Math.min(len, 512*1024));
         parseVorbisComment(buf, result);
       } else if(type === 6){                            // PICTURE
-        const buf = await readSlice(file, ds, ds + Math.min(len, 3*1024*1024));
+        const buf = await readSlice(file, ds, ds + Math.min(len, 16*1024*1024));
         const pic = parseFlacPicture(buf);
         if(pic && !result.picture) result.picture = pic;
       }
@@ -1298,6 +1480,16 @@ function parseVorbisComment(buf, result){
     if(key === 'TITLE' && !result.title) result.title = val;
     else if(key === 'ARTIST' && !result.artist) result.artist = val;
     else if(key === 'ALBUM'  && !result.album)  result.album  = val;
+    else if(key === 'METADATA_BLOCK_PICTURE' && !result.picture){
+      try{
+        const clean = val.replace(/\s+/g, '');
+        const raw = atob(clean);
+        const bin = new Uint8Array(raw.length);
+        for(let j=0;j<raw.length;j++) bin[j] = raw.charCodeAt(j);
+        const pic = parseFlacPicture(bin);
+        if(pic) result.picture = pic;
+      }catch(e){}
+    }
   }
 }
 
@@ -1535,7 +1727,12 @@ function loadFiles(files){
     };
   });
   document.getElementById('fileCount').textContent = playlist.length + ' TRK';
-  curTrack = 0;
+  // プレイリスト差し替え時は旧トラックの状態をリセット。
+  // curTrack = 0 のままだと playTrack(0) が「同じ曲トグル」と誤判定し、
+  // 旧 audioEl.src を再生してしまう。
+  try{ audioEl.pause(); }catch(e){}
+  isPlaying = false;
+  curTrack = -1;          // ← 0 から -1 に変更
   state.cdTrack = 0;
 
   // ---- 曲の長さを順次プリロード（1つのAudioを再利用） ----
@@ -1563,7 +1760,8 @@ function loadFiles(files){
 
       if(id3.picture){
         try{
-          const blob = new Blob([id3.picture.data], {type: id3.picture.mime || 'image/jpeg'});
+          const mime = detectImageMime(id3.picture.data, id3.picture.mime);
+          const blob = new Blob([id3.picture.data], {type: mime});
           const url = URL.createObjectURL(blob);
           const img = new Image();
           img.onload = ()=>{
@@ -1586,7 +1784,26 @@ function loadFiles(files){
       t.id3Loaded = true;              // パース失敗でも完了扱い（模様フォールバックへ）
     });
   });
-}/* アルバムアートを targetSize にエリア平均＋ベイヤーディザで描画 */
+}
+/* マジックバイトから画像 MIME を判定（第2引数はヒント） */
+function detectImageMime(data, hint){
+  if(!data || data.length < 4) return hint || 'image/jpeg';
+  // JPEG: FF D8 FF
+  if(data[0]===0xFF && data[1]===0xD8 && data[2]===0xFF) return 'image/jpeg';
+  // PNG: 89 50 4E 47
+  if(data[0]===0x89 && data[1]===0x50 && data[2]===0x4E && data[3]===0x47) return 'image/png';
+  // GIF: "GIF8"
+  if(data[0]===0x47 && data[1]===0x49 && data[2]===0x46 && data[3]===0x38) return 'image/gif';
+  // BMP: "BM"
+  if(data[0]===0x42 && data[1]===0x4D) return 'image/bmp';
+  // WebP: "RIFF" .... "WEBP"
+  if(data[0]===0x52 && data[1]===0x49 && data[2]===0x46 && data[3]===0x46 &&
+     data.length >= 12 && data[8]===0x57 && data[9]===0x45 && data[10]===0x42 && data[11]===0x50){
+    return 'image/webp';
+  }
+  return hint || 'image/jpeg';
+}
+/* アルバムアートを targetSize にエリア平均＋ベイヤーディザで描画 */
 function drawArtDither(art, ax, ay, targetSize){
   if(!art) return;
   const srcW = art.w, srcH = art.h;
@@ -1978,7 +2195,7 @@ function vizKaleidoscope(x,y,w,h,f){
   const cx = x+w/2, cy = y+h/2;
   const d = getSpectrum(24);
   const R = Math.min(w,h)*0.42;
-  const cols = [4,5,6,7,8,9,10,11,12,13,14];
+  const cols = [4,5,6,7,8,9,10,11,4,5,6];
   for(let s=0;s<6;s++){
     const a0 = s/6*Math.PI*2;
     for(let i=0;i<24;i++){
@@ -2017,7 +2234,8 @@ function vizAurora(x,y,w,h,f){
 function vizGradientWave(x,y,w,h,f){
   const wv = getWave(w);
   // 色数を7に絞り、はっきりした色相の並びに（右端ぼやけ防止）
-  const cs = [4, 6, 7, 3, 10, 11, 15];
+  // パレットは 0〜11 の12色なので、必ず有効なインデックスを使う
+  const cs = [4, 10, 6, 5, 11, 8, 9];   // 赤→橙→黄→緑→青緑→青→紫
   const mid = y + h/2;
   for(let i=0;i<w;i++){
     const yy = mid - Math.round(wv[i]*(h/2-4));
@@ -2930,7 +3148,80 @@ const VIZ_NAMES = [
 /* ==========================================================================
    8. MENU DEFINITIONS
    ========================================================================== */
+/* ---------- SERVICE MODE 用ヘルパ ---------- */
+function svcStub(name, desc){
+  state.stubName = name;
+  state.stubT = 1.6;
+  state.screen = 'svcstub';
+  seNm3();
+}
+function svcGo(name){
+  state.testPhase = 0; state.testT = 0;
+  state.screen = name;
+}
+function svcSpeakerTestStart(){ spkTestStart(0); state.spkTestIdx = 0; state.spkTestT = 0; svcGo('svcspk'); }
+function svcSpeakerTestStop(){ spkTestStop(); }
+
 const MENUS = {
+  /* ---------- SERVICE MODE (33項目) ---------- */
+  service: {
+    title:'SERVICE MODE', titleJp:'サービスモード',
+    items:[
+      {t:'act', label:'SELF DIAGNOSTIC',  labelJp:'自己診断',       act:()=>{ svcGo('diag');   diagStart(); }},
+      {t:'act', label:'BUTTON TEST',      labelJp:'ボタンテスト',   act:()=>{ btnTestLog=[]; svcGo('svcbtn'); }},
+      {t:'act', label:'SPEAKER TEST',     labelJp:'SPテスト',       act:()=>{ svcSpeakerTestStart(); }},
+      {t:'act', label:'SIGNAL GEN',       labelJp:'信号発生',       act:()=>{ svcGo('svcsig'); sigStart(); }},
+      {t:'act', label:'OEL TEST',         labelJp:'OELテスト',      act:()=>{ state.testPhase=0; state.testT=0; state.screen='test'; }},
+      {t:'act', label:'KEY MATRIX TEST',  labelJp:'キーマトリクス', act:()=>{ svcGo('svcbtn'); }},
+      {t:'sub', label:'VERSION DETAIL',   labelJp:'バージョン詳細', to:'svcver'},
+      {t:'act', label:'SETTINGS DUMP',    labelJp:'設定ダンプ',     act:()=>{ state.dumpScroll=0; svcGo('svcdump'); }},
+      {t:'act', label:'EEPROM VIEW',      labelJp:'EEPROM',         act:()=>{ state.eepromScroll=0; svcGo('svceeprom'); }},
+      {t:'act', label:'ERROR LOG',        labelJp:'エラーログ',     act:()=>{ svcGo('svcerr'); }},
+      {t:'act', label:'AUDIO MONITOR',    labelJp:'音声モニタ',     act:()=>{ svcGo('svcaud'); }},
+      {t:'act', label:'RTC TEST',         labelJp:'RTCテスト',      act:()=>{ svcStub('RTC TEST','RTC:DS1307'); }},
+      {t:'act', label:'ADC MONITOR',      labelJp:'ADC',            act:()=>{ svcStub('ADC MONITOR','CH0..CH7'); }},
+      {t:'act', label:'VOLTAGE MON',      labelJp:'電圧',           act:()=>{ svcStub('VOLTAGE','12.4V NOM'); }},
+      {t:'act', label:'TEMPERATURE',      labelJp:'温度',           act:()=>{ svcStub('TEMP SENSOR','32.1 C'); }},
+      {t:'act', label:'USB TEST',         labelJp:'USB',            act:()=>{ svcStub('USB TEST','VBUS/HOST'); }},
+      {t:'act', label:'SD TEST',          labelJp:'SD',             act:()=>{ svcStub('SD TEST','CMD0/CMD8'); }},
+      {t:'act', label:'CD MECH TEST',     labelJp:'CDメカ',         act:()=>{ svcStub('CD MECH','LOAD/EJ/CLAMP'); }},
+      {t:'act', label:'TUNER TEST',       labelJp:'チューナ',       act:()=>{ svcStub('TUNER RSSI','FM/AM'); }},
+      {t:'act', label:'TUNER ALIGN',      labelJp:'チューナ調整',   act:()=>{ svcStub('TUNER ALIGN','LO/IF FREQ'); }},
+      {t:'act', label:'GPS MONITOR',      labelJp:'GPS',            act:()=>{ svcStub('GPS','3D FIX 8SAT'); }},
+      {t:'act', label:'CAN BUS MONITOR',  labelJp:'CANバス',        act:()=>{ svcStub('CAN BUS','500Kbps'); }},
+      {t:'act', label:'AUDIO PATH TEST',  labelJp:'音声経路',       act:()=>{ svcStub('AUDIO PATH','DAC->AMP->SPK'); }},
+      {t:'act', label:'DSP LOAD TEST',    labelJp:'DSP負荷',        act:()=>{ svcStub('DSP LOAD','MIPS 42%'); }},
+      {t:'act', label:'RAM TEST',         labelJp:'RAM',            act:()=>{ svcStub('RAM TEST','64MB OK'); }},
+      {t:'act', label:'FLASH TEST',       labelJp:'FLASH',          act:()=>{ svcStub('FLASH TEST','32MB OK'); }},
+      {t:'act', label:'WATCHDOG TEST',    labelJp:'WDT',            act:()=>{ svcStub('WATCHDOG','1s WDT'); }},
+      {t:'act', label:'BURN-IN MODE',     labelJp:'バーンイン',     act:()=>{ svcStub('BURN-IN','24H CYCLE'); }},
+      {t:'act', label:'SHIPPING MODE',    labelJp:'出荷モード',     act:()=>{ svcStub('SHIPPING','DEMO LOOP'); }},
+      {t:'act', label:'ENGINE LOAD (JS)', labelJp:'エンジン読込',   act:()=>{ enginePickFile(); }},
+      {t:'act', label:'PLUGIN LIST',      labelJp:'プラグイン一覧', act:()=>{ svcGo('svcplug'); }},
+      {t:'act', label:'FACTORY RESET',    labelJp:'工場出荷状態',   act:()=>{ state.confirmDialog={
+          title:L('CONFIRM','確認'),
+          message:L('Factory reset?','工場出荷状態に戻しますか?'),
+          subMessage:'ALL SETTINGS WILL BE LOST', sel:0,
+          onYes:()=>{ try{ localStorage.removeItem('PAAUDIO_PAA100'); }catch(e){} fullInit(); svcStub('FACTORY','RESET DONE'); },
+          onNo:()=>{}};
+      }},
+      {t:'act', label:'EXIT SERVICE',     labelJp:'サービス終了',   act:()=>{ svcSpeakerTestStop(); sigStop(); fadeTransition(()=>{ state.stack=['root']; state.menuIdx=0; state.screen='menu'; }); }},
+    ]
+  },
+  svcver: {
+    title:'VERSION DETAIL', titleJp:'バージョン詳細',
+    items:[
+      {t:'info', label:'MODEL',   labelJp:'モデル',   val:'PAA-100'},
+      {t:'info', label:'SERIAL',  labelJp:'シリアル', val:'SN-0000-PA10'},
+      {t:'info', label:'MAIN FW', labelJp:'メインFW', val:'3.50'},
+      {t:'info', label:'DSP FW',  labelJp:'DSP',      val:'1.02'},
+      {t:'info', label:'OEL FW',  labelJp:'OEL',      val:'0.87'},
+      {t:'info', label:'BUILD',   labelJp:'ビルド',   val:'2026.09.21'},
+      {t:'info', label:'REGION',  labelJp:'リージョン', val:'JP'},
+      {t:'info', label:'TAKT',    labelJp:'クロック', val:'96MHz'},
+      {t:'info', label:'CORE',    labelJp:'コア電圧', val:'1.20V'},
+    ]
+  },
   root: {
     title:'MAIN MENU', titleJp:'メインメニュー',
     items:[
@@ -3021,7 +3312,7 @@ const MENUS = {
       {t:'sel', label:'CLOCK',         labelJp:'時計表示',       key:'clock24', opts:['24H','12H']},
       {t:'sel', label:'TITLE SCROLL',  labelJp:'タイトルスクロール', key:'scrollOn', opts:['ON','OFF']},
       {t:'sel', label:'DEMO MODE',     labelJp:'デモモード',     key:'demoOn', opts:['OFF','ON']},
-      {t:'act', label:'PANEL TEST',    labelJp:'パネルテスト',   act:()=>{ fadeTransition(()=>{ state.screen='test'; }); }},
+      {t:'act', label:'PANEL TEST',    labelJp:'パネルテスト',   act:()=>{ state.testPhase=0; state.testT=0; state.screen='test'; }},
     ]
   },
   playback: {
@@ -3055,7 +3346,7 @@ const MENUS = {
       {t:'act', label:'INITIALIZE ALL', labelJp:'全初期化',       act:()=>{ fullInit(); }},
       {t:'act', label:'SAVE SETTINGS',  labelJp:'設定を保存',     act:()=>{ saveSettings(); }},
       {t:'act', label:'LOAD SETTINGS',  labelJp:'設定を読込',     act:()=>{ loadSettings(); applyAllSettings(); }},
-      {t:'act', label:'OEL TEST PATTERN',labelJp:'OELテスト',     act:()=>{ fadeTransition(()=>{ state.screen='test'; }); }},
+      {t:'act', label:'OEL TEST PATTERN',labelJp:'OELテスト',     act:()=>{ state.testPhase=0; state.testT=0; state.screen='test'; }},
       {t:'info',label:'BUILD',          labelJp:'ビルド',         val:'2026.09.21'},
     ]
   },
@@ -3070,6 +3361,1570 @@ const EQ_PRESETS = [
   [-2,-1, 0, 1, 3, 4, 4, 3, 1, 0,-1,-2,-2],
   [ 7, 6, 4, 2, 0, 0, 0, 1, 3, 5, 6, 7, 7],
 ];
+/* ==========================================================================
+   SERVICE MODE SCREENS
+   ========================================================================== */
+
+/* --- スタブ画面 --- */
+function drawSvcStub(){
+  clearFB(0);
+  fillRect(0,0,W,STATUS_H,2);
+  drawText('SERVICE MODE', 4, 4, 3, 0);
+  drawTextRight(L('[ESC]BACK','[ESC]戻る'), W-4, 4, 2, 0);
+  hline(0, STATUS_H-1, W, 3);
+
+  const pulse = (Math.floor(state.frame/4)%2)===0;
+  drawTextCenter(state.stubName || 'ITEM', W/2, 42, 3, 1);
+  drawTextCenter(L('EXECUTING...','実行中...'), W/2, 58, pulse?6:2);
+  drawTextCenter('N/A ON THIS UNIT', W/2, 76, 1, 0);
+}
+
+/* --- 自己診断 --- */
+const DIAG_ITEMS = [
+  ['CPU','SH-4A CORE'], ['SDRAM','64MB CHECK'], ['FLASH','32MB CHECK'],
+  ['DSP','SOUND ENGINE'], ['OEL','DISPLAY PANEL'], ['TUNER','FM/AM FRONTEND'],
+  ['MEDIA','USB/SD I/F'], ['AUDIO','AMP OUTPUT'],
+];
+function diagStart(){ state.diagStep = 0; }
+function drawDiag(){
+  clearFB(0);
+  fillRect(0,0,W,STATUS_H,2);
+  drawText('SELF DIAGNOSTIC', 4, 4, 3, 0);
+  drawTextRight(L('[ESC]EXIT','[ESC]終了'), W-4, 4, 2, 0);
+  const y0 = STATUS_H + 3;
+  for(let i=0;i<DIAG_ITEMS.length;i++){
+    const y = y0 + i*11;
+    drawText(DIAG_ITEMS[i][0], 6, y, 2, 0);
+    drawText(DIAG_ITEMS[i][1], 46, y, 1, 0);
+    if(i < state.diagStep) drawTextRight('OK', W-4, y, 5, 0);
+    else if(i === state.diagStep && (state.frame>>2 & 1)===0)
+      drawTextRight('....', W-4, y, 6, 0);
+  }
+  if(state.diagStep >= DIAG_ITEMS.length)
+    drawTextCenter('ALL PASS', W/2, H-11, 5, 0);
+}
+
+/* --- ボタンテスト --- */
+let btnTestLog = [];
+function drawBtnTest(){
+  clearFB(0);
+  fillRect(0,0,W,STATUS_H,2);
+  drawText('BUTTON TEST', 4, 4, 3, 0);
+  drawTextRight(L('[ESC]EXIT','[ESC]終了'), W-4, 4, 2, 0);
+  const y0 = STATUS_H + 8;
+  for(let i=0;i<Math.min(btnTestLog.length, 20);i++){
+    const row = Math.floor(i/6), col = i%6;
+    const x = 6 + col*76;
+    const y = y0 + row*14;
+    fillRect(x, y, 72, 12, 3);
+    drawTextPset(btnTestLog[i], x+4, y+3, 0, 0);
+  }
+  if(!btnTestLog.length)
+    drawTextCenter(L('PRESS ANY KEY...','何かキーを押してください...'), W/2, y0+20, 2);
+}
+
+/* --- スピーカーテスト --- */
+const SPK_CH = [
+  { name:'FRONT L',      freq:1000, pan:-1.0, jp:'前左' },
+  { name:'FRONT R',      freq:1000, pan: 1.0, jp:'前右' },
+  { name:'REAR L',       freq:1000, pan:-1.0, jp:'後左' },
+  { name:'REAR R',       freq:1000, pan: 1.0, jp:'後右' },
+  { name:'SUB WOOFER',   freq: 60,  pan: 0.0, jp:'サブウーファ' },
+  { name:'LEFT (FL+RL)', freq:1000, pan:-1.0, jp:'左ch' },
+  { name:'RIGHT(FR+RR)', freq:1000, pan: 1.0, jp:'右ch' },
+  { name:'ALL',          freq:1000, pan: 0.0, jp:'全ch' },
+];
+function drawSpkTest(){
+  clearFB(0);
+  fillRect(0,0,W,STATUS_H,2);
+  drawText('SPEAKER TEST', 4, 4, 3, 0);
+  drawTextRight(L('[ESC]EXIT','[ESC]終了'), W-4, 4, 2, 0);
+
+  const ch = SPK_CH[state.spkTestIdx];
+  const cx = W/2, cy = 50;
+  // 車体
+  rectOutline(cx-80, cy-16, 160, 32, 1);
+  // 4スピーカー位置
+  const spkPos = [
+    [cx-70, cy-12], [cx+70, cy-12], [cx-70, cy+12], [cx+70, cy+12]
+  ];
+  const activeIdx = (state.spkTestIdx < 4) ? state.spkTestIdx
+                  : (state.spkTestIdx === 5 ? 2 : state.spkTestIdx === 6 ? 3 : -1);
+  const activeFL = state.spkTestIdx===0 || state.spkTestIdx===5 || state.spkTestIdx===7;
+  const activeFR = state.spkTestIdx===1 || state.spkTestIdx===6 || state.spkTestIdx===7;
+  const activeRL = state.spkTestIdx===2 || state.spkTestIdx===5 || state.spkTestIdx===7;
+  const activeRR = state.spkTestIdx===3 || state.spkTestIdx===6 || state.spkTestIdx===7;
+  const act = [activeFL, activeFR, activeRL, activeRR];
+  const pulse = (Math.floor(state.frame/3)%2)===0;
+
+  for(let i=0;i<4;i++){
+    const [x,y] = spkPos[i];
+    const c = act[i] ? (pulse ? 5 : 6) : 2;
+    for(let a=0;a<Math.PI*2;a+=0.4)
+      px(x+Math.cos(a)*5, y+Math.sin(a)*5, c);
+    px(x, y, act[i]?3:1);
+  }
+  // サブ
+  if(state.spkTestIdx===4){
+    for(let a=0;a<Math.PI*2;a+=0.4)
+      px(cx+Math.cos(a)*8, cy+Math.sin(a)*8, pulse?4:6);
+  }
+  // ラベル
+  const lbl = state.lang===1 ? ch.jp : ch.name;
+  drawTextCenter(lbl, cx, 78, act.some(Boolean)||state.spkTestIdx===4 ? 3 : 2, 1);
+  drawTextCenter(String(state.spkTestIdx+1) + ' / ' + SPK_CH.length, cx, 92, 2);
+  drawTextCenter(L('[LR]SELECT [ENT]NEXT [ESC]EXIT',
+                   '[←→]選択 [決定]次へ [ESC]終了'), cx, 104, 1);
+}
+
+/* --- 信号発生器 --- */
+const SIG_LIST = [
+  { name:'1kHz SINE',   kind:'sine',   freq:1000 },
+  { name:'100Hz SINE',  kind:'sine',   freq: 100 },
+  { name:'10kHz SINE',  kind:'sine',   freq:10000 },
+  { name:'60Hz SINE',   kind:'sine',   freq: 60 },
+  { name:'SWEEP 20-20k',kind:'sweep',  freq:0 },
+  { name:'WHITE NOISE', kind:'white',  freq:0 },
+  { name:'PINK NOISE',  kind:'pink',   freq:0 },
+  { name:'SILENCE',     kind:'silent', freq:0 },
+];
+function drawSigGen(){
+  clearFB(0);
+  fillRect(0,0,W,STATUS_H,2);
+  drawText('SIGNAL GEN', 4, 4, 3, 0);
+  drawTextRight(L('[ESC]EXIT','[ESC]終了'), W-4, 4, 2, 0);
+  hline(0, STATUS_H-1, W, 3);
+
+  const y0 = STATUS_H + 4;
+  for(let i=0;i<SIG_LIST.length;i++){
+    const y = y0 + i*11;
+    const sel = i === state.sigIdx;
+    if(sel) fillRect(0, y-1, W-80, 11, 1);
+    drawText((sel?'> ':'  ') + SIG_LIST[i].name, 4, y, sel?3:2, 0);
+  }
+  // 右側の L/R セレクタ
+  const rx = W-76;
+  rectOutline(rx, y0-1, 72, 44, 2);
+  drawText('OUTPUT', rx+6, y0+2, 1, 0);
+  const lr = ['L','R','BOTH'];
+  for(let i=0;i<3;i++){
+    const y = y0+13 + i*10;
+    const sel = i === state.sigLR;
+    if(sel){ fillRect(rx+2, y-1, 68, 9, 3); drawTextPset(lr[i], rx+6, y, 0, 0); }
+    else drawText(lr[i], rx+6, y, 2, 0);
+  }
+  // 波形モニタ
+  const wy = y0 + 56;
+  rectOutline(4, wy, W-8, 30, 1);
+  const wv = getWave(W-12);
+  for(let i=0;i<W-12;i++){
+    const yy = wy+15 - Math.round(wv[i]*13);
+    px(6+i, yy, 3);
+  }
+  drawText(L('[LR]CH [UD]SEL [ENT]LR','[←→]ch [↑↓]選択 [決定]L/R'), 4, H-11, 1, 0);
+}
+
+/* --- 設定ダンプ --- */
+function drawSettingsDump(){
+  clearFB(0);
+  fillRect(0,0,W,STATUS_H,2);
+  drawText('SETTINGS DUMP', 4, 4, 3, 0);
+  drawTextRight(L('[UD]SCROLL [ESC]EXIT','[↑↓]スクロール [ESC]終了'), W-4, 4, 1, 0);
+
+  const rows = [];
+  PERSIST_KEYS.forEach(k=>{
+    const v = state[k];
+    let s;
+    if(Array.isArray(v)) s = '[' + v.slice(0,6).join(',') + (v.length>6?',…':'') + ']';
+    else if(typeof v === 'boolean') s = v ? 'ON' : 'OFF';
+    else s = String(v);
+    rows.push([k, s]);
+  });
+
+  const y0 = STATUS_H + 3;
+  const rowH = 8;
+  const maxRows = Math.floor((H - y0 - 12) / rowH);
+  const maxScroll = Math.max(0, rows.length - maxRows);
+  state.dumpScroll = clamp(state.dumpScroll|0, 0, maxScroll);
+
+  for(let i=0;i<maxRows;i++){
+    const idx = state.dumpScroll + i;
+    if(idx >= rows.length) break;
+    const y = y0 + i*rowH;
+    const sel = (i & 1) === 0;
+    if(sel) fillRect(0, y-1, W, rowH, 1);
+    drawText(rows[idx][0], 4, y, 2, 0);
+    drawTextRight(rows[idx][1], W-4, y, 3, 0);
+  }
+  // スクロールバー
+  const trackH = H - y0 - 12;
+  const barH = Math.max(6, Math.floor(trackH * maxRows / Math.max(1, rows.length)));
+  const barY = y0 + Math.floor((trackH - barH) * state.dumpScroll / Math.max(1, maxScroll));
+  fillRect(W-2, barY, 2, barH, 3);
+  drawText(rows.length + ' ITEMS', 4, H-9, 1, 0);
+}
+
+/* --- EEPROM VIEW --- */
+function drawEeprom(){
+  clearFB(0);
+  fillRect(0,0,W,STATUS_H,2);
+  drawText('EEPROM VIEW', 4, 4, 3, 0);
+  drawTextRight(L('[UD]SCROLL [ESC]EXIT','[↑↓]スクロール [ESC]終了'), W-4, 4, 1, 0);
+
+  const raw = localStorage.getItem('PAAUDIO_PAA100') || '';
+  const bytes = new TextEncoder().encode(raw);
+
+  const y0 = STATUS_H + 3;
+  const rowH = 8;
+  const maxRows = Math.floor((H - y0 - 12) / rowH);
+  const totalRows = Math.ceil(bytes.length / 8);
+  const maxScroll = Math.max(0, totalRows - maxRows);
+  state.eepromScroll = clamp(state.eepromScroll|0, 0, maxScroll);
+
+  for(let i=0;i<maxRows;i++){
+    const r = state.eepromScroll + i;
+    const off = r * 8;
+    if(off >= bytes.length) break;
+    const y = y0 + i*rowH;
+    drawText(off.toString(16).toUpperCase().padStart(4,'0'), 4, y, 1, 0);
+    let hex = '';
+    for(let k=0;k<8;k++){
+      const b = bytes[off+k];
+      hex += (b===undefined ? '..' : b.toString(16).toUpperCase().padStart(2,'0')) + ' ';
+    }
+    drawText(hex, 36, y, 3, 0);
+  }
+  drawTextCenter('SIZE ' + bytes.length + 'B   ROW ' + (state.eepromScroll+1) + '/' + Math.max(1,totalRows),
+                 W/2, H-9, 1);
+}
+
+/* --- エラーログ --- */
+let errLog = [];
+window.addEventListener('error', e=>{
+  errLog.unshift({ t: new Date(), msg: String(e.message||'ERR').slice(0,40) });
+  if(errLog.length > 20) errLog.pop();
+});
+function drawErrorLog(){
+  clearFB(0);
+  fillRect(0,0,W,STATUS_H,2);
+  drawText('ERROR LOG', 4, 4, 3, 0);
+  drawTextRight(L('[ESC]EXIT','[ESC]終了'), W-4, 4, 2, 0);
+  const y0 = STATUS_H + 4;
+  if(!errLog.length){
+    drawTextCenter('NO ERRORS', W/2, 50, 5, 1);
+  } else {
+    for(let i=0;i<Math.min(errLog.length, 10);i++){
+      const y = y0 + i*10;
+      const t = errLog[i].t;
+      drawText(pad2(t.getHours())+':'+pad2(t.getMinutes())+':'+pad2(t.getSeconds()),
+               4, y, 1, 0);
+      drawText(errLog[i].msg, 48, y, 4, 0);
+    }
+  }
+}
+
+/* --- 音声モニタ (L/R level) --- */
+function drawAudioMonitor(){
+  clearFB(0);
+  fillRect(0,0,W,STATUS_H,2);
+  drawText('AUDIO MONITOR', 4, 4, 3, 0);
+  drawTextRight(L('[ESC]EXIT','[ESC]終了'), W-4, 4, 2, 0);
+
+  const d = getSpectrum(32);
+  let l=0, r=0;
+  for(let i=0;i<16;i++) l += d[i];
+  for(let i=16;i<32;i++) r += d[i];
+  l = Math.min(1, l/16*1.7);
+  r = Math.min(1, r/16*1.7);
+
+  const drawBar = (x,y,w,h,v,label)=>{
+    drawText(label, x, y-8, 2, 0);
+    for(let i=0;i<w;i++){
+      const on = (i/w) < v;
+      const c = on ? (i>w*0.85?4:(i>w*0.65?6:5)) : 1;
+      for(let j=0;j<h;j++) px(x+i, y+j, c);
+    }
+    rectOutline(x-1, y-1, w+2, h+2, 1);
+    // 目盛り
+    for(let i=0;i<=10;i++){
+      const tx = x + Math.floor(i/10*(w-1));
+      for(let j=0;j<3;j++) px(tx, y+h+2+j, 2);
+    }
+    // ピーク
+    const px_ = x + Math.floor(v*(w-1));
+    for(let j=0;j<h;j++) px(px_, y+j, 3);
+  };
+  drawBar(20, 30, W-40, 12, l, 'L');
+  drawBar(20, 60, W-40, 12, r, 'R');
+  // 波形
+  const wv = getWave(W-40);
+  for(let i=0;i<W-40;i++){
+    const yy = 92 - Math.round(wv[i]*10);
+    px(20+i, yy, 3);
+  }
+  hline(20, 92, W-40, 1);
+  // 数値
+  drawText('L ' + Math.round(l*100).toString().padStart(3,' ') + '%', 20, 102, 2, 0);
+  drawText('R ' + Math.round(r*100).toString().padStart(3,' ') + '%', W-70, 102, 2, 0);
+}
+
+/* --- プラグイン一覧 --- */
+function drawPluginList(){
+  clearFB(0);
+  fillRect(0,0,W,STATUS_H,2);
+  drawText('PLUGIN LIST', 4, 4, 3, 0);
+  drawTextRight(L('[ESC]EXIT','[ESC]終了'), W-4, 4, 2, 0);
+  const y0 = STATUS_H + 6;
+  if(!state.enginePlugins.length){
+    drawTextCenter(L('NO PLUGINS LOADED','プラグイン未読込'), W/2, 45, 2);
+    drawTextCenter(L('LOAD .JS FROM ENGINE LOAD','ENGINE LOAD から読込'), W/2, 60, 1);
+  } else {
+    for(let i=0;i<state.enginePlugins.length;i++){
+      const p = state.enginePlugins[i];
+      const y = y0 + i*16;
+      drawText(String(i+1) + '. ' + p.name, 4, y, 3, 0);
+      drawText('v' + (p.version||'?'), 4, y+8, 1, 0);
+      drawText((p.items ? p.items.length : 0) + ' ITEM', 60, y+8, 2, 0);
+    }
+  }
+}
+/* ==========================================================================
+   TEST TONE ENGINE (speaker test / signal gen)
+   ========================================================================== */
+let testOsc = null, testPan = null, testGain = null, testNoise = null, testNoiseFilt = null;
+let testMode = 'off';
+
+function testToneStop(){
+  try{ if(testOsc){ testOsc.stop(); testOsc.disconnect(); } }catch(e){}
+  try{ if(testPan) testPan.disconnect(); }catch(e){}
+  try{ if(testGain) testGain.disconnect(); }catch(e){}
+  try{ if(testNoise){ testNoise.stop(); testNoise.disconnect(); } }catch(e){}
+  try{ if(testNoiseFilt) testNoiseFilt.disconnect(); }catch(e){}
+  testOsc = testPan = testGain = testNoise = testNoiseFilt = null;
+  testMode = 'off';
+}
+function testToneStart(kind, freq, pan, vol){
+  if(!actx) return;
+  testToneStop();
+  testGain = actx.createGain();
+  testGain.gain.value = 0;
+  testPan = actx.createStereoPanner();
+  testPan.pan.value = pan;
+  testGain.connect(testPan);
+  testPan.connect(actx.destination);
+
+  if(kind === 'white' || kind === 'pink'){
+    const len = actx.sampleRate * 2;
+    const buf = actx.createBuffer(1, len, actx.sampleRate);
+    const dd = buf.getChannelData(0);
+    let b0=0,b1=0,b2=0,b3=0,b4=0,b5=0,b6=0;
+    for(let i=0;i<len;i++){
+      const w = Math.random()*2-1;
+      if(kind === 'pink'){
+        b0 = 0.99886*b0 + w*0.0555179;
+        b1 = 0.99332*b1 + w*0.0750759;
+        b2 = 0.96900*b2 + w*0.1538520;
+        b3 = 0.86650*b3 + w*0.3104856;
+        b4 = 0.55000*b4 + w*0.5329522;
+        b5 = -0.7616*b5 - w*0.0168980;
+        dd[i] = (b0+b1+b2+b3+b4+b5+b6+w*0.5362)*0.11;
+        b6 = w*0.115926;
+      } else {
+        dd[i] = w;
+      }
+    }
+    testNoise = actx.createBufferSource();
+    testNoise.buffer = buf;
+    testNoise.loop = true;
+    testNoise.connect(testGain);
+    testNoise.start();
+  } else if(kind === 'sweep'){
+    testOsc = actx.createOscillator();
+    testOsc.type = 'sine';
+    testOsc.frequency.setValueAtTime(20, actx.currentTime);
+    testOsc.frequency.exponentialRampToValueAtTime(20000, actx.currentTime + 6);
+    testOsc.connect(testGain);
+    testOsc.start();
+  } else if(kind === 'silent'){
+    // nothing
+  } else {
+    testOsc = actx.createOscillator();
+    testOsc.type = kind || 'sine';
+    testOsc.frequency.value = freq || 1000;
+    testOsc.connect(testGain);
+    testOsc.start();
+  }
+  testGain.gain.setTargetAtTime(vol || 0.15, actx.currentTime, 0.05);
+  testMode = kind;
+}
+
+function spkTestStart(idx){
+  state.spkTestIdx = idx % SPK_CH.length;
+  const ch = SPK_CH[state.spkTestIdx];
+  if(!actx){ initAudio(); }
+  if(actx && actx.state === 'suspended') actx.resume();
+  testToneStart('sine', ch.freq, ch.pan, 0.18);
+}
+function spkTestStop(){ testToneStop(); }
+
+function sigStart(){
+  const s = SIG_LIST[state.sigIdx];
+  const pan = state.sigLR === 0 ? -1 : state.sigLR === 1 ? 1 : 0;
+  if(!actx){ initAudio(); }
+  if(actx && actx.state === 'suspended') actx.resume();
+  testToneStart(s.kind, s.freq, pan, 0.15);
+}
+function sigStop(){ testToneStop(); }
+
+/* ==========================================================================
+   SERVICE TEST AUDIO ENGINE
+   ========================================================================== */
+const svcEng = {
+  active: null,
+  nodes: [],
+  osc: null, osc2: null, noise: null,
+  gain: null, pan: null, filter: null, filter2: null,
+  delay: null, fb: null, shaper: null, conv: null,
+  comp: null, mod: null, modGain: null,
+  split: null, merge: null, invL: null, invR: null,
+  params: {},
+  resumeMusic: false,
+
+  cleanup(){
+    for(const n of this.nodes){
+      try{ if(n.stop) n.stop(); }catch(e){}
+      try{ n.disconnect(); }catch(e){}
+    }
+    this.nodes = [];
+    this.osc = this.osc2 = this.noise = null;
+    this.gain = this.pan = this.filter = this.filter2 = null;
+    this.delay = this.fb = this.shaper = this.conv = null;
+    this.comp = this.mod = this.modGain = null;
+    this.split = this.merge = this.invL = this.invR = null;
+    this.active = null;
+    this.params = {};
+    if(this.impInterval){ clearInterval(this.impInterval); this.impInterval = null; }
+  },
+  add(n){ if(n){ this.nodes.push(n); } return n; },
+
+  _ensureCtx(){
+    if(!actx){ initAudio(); }
+    if(actx && actx.state === 'suspended') actx.resume();
+    return actx;
+  },
+
+  makeOsc(freq, type){
+    const o = actx.createOscillator();
+    o.type = type || 'sine';
+    o.frequency.value = freq;
+    this.add(o);
+    return o;
+  },
+  makeNoise(kind){
+    const len = actx.sampleRate * 2;
+    const buf = actx.createBuffer(1, len, actx.sampleRate);
+    const d = buf.getChannelData(0);
+    if(kind === 'pink'){
+      let b0=0,b1=0,b2=0,b3=0,b4=0,b5=0,b6=0;
+      for(let i=0;i<len;i++){
+        const w = Math.random()*2-1;
+        b0 = 0.99886*b0 + w*0.0555179;
+        b1 = 0.99332*b1 + w*0.0750759;
+        b2 = 0.96900*b2 + w*0.1538520;
+        b3 = 0.86650*b3 + w*0.3104856;
+        b4 = 0.55000*b4 + w*0.5329522;
+        b5 = -0.7616*b5 - w*0.0168980;
+        d[i] = (b0+b1+b2+b3+b4+b5+b6+w*0.5362)*0.11;
+        b6 = w*0.115926;
+      }
+    } else {
+      for(let i=0;i<len;i++) d[i] = Math.random()*2-1;
+    }
+    const src = actx.createBufferSource();
+    src.buffer = buf; src.loop = true;
+    this.add(src);
+    return src;
+  },
+  makeGain(v){ const g = actx.createGain(); g.gain.value = v; this.add(g); return g; },
+  makePan(p){ const n = actx.createStereoPanner(); n.pan.value = p||0; this.add(n); return n; },
+
+  stop(){
+    if(this.resumeMusic && audioEl.src && state.discIn && playlist.length){
+      audioEl.play().catch(()=>{});
+    }
+    this.resumeMusic = false;
+    this.cleanup();
+  },
+
+  begin(){
+    if(isPlaying && !audioEl.paused){
+      this.resumeMusic = true;
+      audioEl.pause();
+    }
+    this.cleanup();
+    this._ensureCtx();
+  },
+};
+
+/* ==========================================================================
+   15 SERVICE TESTS
+   ========================================================================== */
+const SVC_TESTS = {
+
+  /* -------- 1. PHASE TEST -------- */
+  phase: {
+    name:'PHASE TEST', jp:'位相テスト',
+    hint:'[LR]反転 [UD]周波数 [ENT]音切替 [ESC]戻る',
+    start(){
+      svcEng.begin();
+      svcEng.params = { invertL:false, invertR:false, freq:100, playing:true };
+      const osc = svcEng.makeOsc(100, 'sine');
+      const gain = svcEng.makeGain(0.15);
+      const split = actx.createChannelSplitter(2);
+      const merge = actx.createChannelMerger(2);
+      const gL = actx.createGain(); gL.gain.value = 1;
+      const gR = actx.createGain(); gR.gain.value = 1;
+      svcEng.add(split); svcEng.add(merge); svcEng.add(gL); svcEng.add(gR);
+      svcEng.osc = osc; svcEng.gain = gain;
+      svcEng.split = split; svcEng.merge = merge;
+      svcEng.invL = gL; svcEng.invR = gR;
+      osc.connect(gain);
+      gain.connect(split);
+      split.connect(gL, 0);
+      split.connect(gR, 1);
+      gL.connect(merge, 0, 0);
+      gR.connect(merge, 0, 1);
+      merge.connect(actx.destination);
+      osc.start();
+    },
+    draw(f){
+      clearFB(0);
+      drawSvcHeader('PHASE TEST', this.jp);
+      const cx = W/2;
+      const p = svcEng.params;
+      const cancel = (p.invertL !== p.invertR);
+      for(let s=0;s<2;s++){
+        const x = cx + (s===0 ? -90 : 90);
+        const inv = s===0 ? p.invertL : p.invertR;
+        const c = inv ? 4 : 5;
+        for(let a=0;a<Math.PI*2;a+=0.12)
+          px(x+Math.cos(a)*22, 50+Math.sin(a)*22, 2);
+        for(let i=0;i<40;i++){
+          const xx = x - 20 + i;
+          const yy = 50 + (inv ? -1 : 1) * Math.sin(i*0.4 + f*0.4) * 10;
+          px(xx, yy, c);
+        }
+        drawTextCenter(s===0?'L':'R', x, 78, c, 1);
+        if(inv) drawTextCenter('INV', x, 90, 4, 0);
+      }
+      drawTextCenter(cancel ? '<< MONO CANCEL >>' : '<< MONO BOOST >>',
+                     cx, 20, cancel?4:5, 1);
+      drawTextCenter(Math.round(p.freq) + ' Hz', cx, 100, 3, 1);
+      drawTextCenter(this.hint, cx, 112, 1, 0);
+    },
+    onKey(k){
+      const p = svcEng.params;
+      if(k==='LEFT'){  p.invertL = !p.invertL; svcEng.invL.gain.value = p.invertL ? -1 : 1; seNm3(); }
+      if(k==='RIGHT'){ p.invertR = !p.invertR; svcEng.invR.gain.value = p.invertR ? -1 : 1; seNm3(); }
+      if(k==='UP'){   p.freq = Math.min(4000, p.freq * 1.25); svcEng.osc.frequency.value = p.freq; seUp3(); }
+      if(k==='DOWN'){ p.freq = Math.max(30,   p.freq / 1.25); svcEng.osc.frequency.value = p.freq; seDn3(); }
+      if(k==='ENTER'){
+        p.playing = !p.playing;
+        svcEng.gain.gain.setTargetAtTime(p.playing?0.15:0, actx.currentTime, 0.02);
+        seNm3();
+      }
+    }
+  },
+
+  /* -------- 2. AUTO PAN -------- */
+  autopan: {
+    name:'AUTO PAN', jp:'自動パン',
+    hint:'[UD]速度 [ESC]戻る',
+    start(){
+      svcEng.begin();
+      svcEng.params = { speed:1.0 };
+      const osc = svcEng.makeOsc(440, 'sine');
+      const pan = svcEng.makePan(0);
+      const gain = svcEng.makeGain(0.16);
+      const lfo = svcEng.makeOsc(1.0, 'sine');
+      const lfoGain = svcEng.makeGain(1.0);
+      svcEng.osc = osc; svcEng.pan = pan; svcEng.gain = gain;
+      svcEng.mod = lfo; svcEng.modGain = lfoGain;
+      osc.connect(gain); gain.connect(pan); pan.connect(actx.destination);
+      lfo.connect(lfoGain); lfoGain.connect(pan.pan);
+      osc.start(); lfo.start();
+    },
+    draw(f){
+      clearFB(0);
+      drawSvcHeader('AUTO PAN', this.jp);
+      const cx = W/2, cy = 55;
+      for(let a=0;a<Math.PI*2;a+=0.1) px(cx+Math.cos(a)*10, cy+Math.sin(a)*12, 2);
+      const p = svcEng.params;
+      const panPos = svcEng.pan ? svcEng.pan.pan.value : 0;
+      const sx = cx + panPos * 160;
+      for(let i=0;i<W;i+=4) px(i, cy, 1);
+      for(let dx=-3;dx<=3;dx++) for(let dy=-3;dy<=3;dy++)
+        if(dx*dx+dy*dy<=9) px(sx+dx, cy+dy, 5);
+      drawTextCenter('L', cx-170, cy, 2, 1);
+      drawTextCenter('R', cx+170, cy, 2, 1);
+      drawTextCenter('C', cx, cy-22, 1, 0);
+      drawTextCenter('PAN ' + (panPos>=0?'+':'') + panPos.toFixed(2), cx, 90, 3, 1);
+      drawTextCenter('SPEED ' + p.speed.toFixed(2) + ' Hz', cx, 102, 6, 0);
+      drawTextCenter(this.hint, cx, 114, 1, 0);
+    },
+    onKey(k){
+      const p = svcEng.params;
+      if(k==='UP'){   p.speed = Math.min(5, p.speed+0.25); svcEng.mod.frequency.value = p.speed; seUp3(); }
+      if(k==='DOWN'){ p.speed = Math.max(0.1, p.speed-0.25); svcEng.mod.frequency.value = p.speed; seDn3(); }
+    }
+  },
+
+  /* -------- 3. FREQ SWEEP -------- */
+  sweep: {
+    name:'FREQ SWEEP', jp:'周波数スイープ',
+    hint:'[LR]周波数 [ENT]自動/手動 [UD]速度 [ESC]戻る',
+    start(){
+      svcEng.begin();
+      svcEng.params = { freq:1000, auto:false, speed:1.0, dir:1 };
+      const osc = svcEng.makeOsc(1000, 'sine');
+      const gain = svcEng.makeGain(0.15);
+      svcEng.osc = osc; svcEng.gain = gain;
+      osc.connect(gain); gain.connect(actx.destination);
+      osc.start();
+    },
+    draw(f){
+      clearFB(0);
+      drawSvcHeader('FREQ SWEEP', this.jp);
+      const p = svcEng.params;
+      if(p.auto){
+        const dt = 1/15;
+        p.freq *= Math.pow(10, p.dir * p.speed * dt * 0.5);
+        if(p.freq > 20000){ p.freq = 20000; p.dir = -1; }
+        if(p.freq < 20){ p.freq = 20; p.dir = 1; }
+        svcEng.osc.frequency.value = p.freq;
+      }
+      const logMin = Math.log10(20), logMax = Math.log10(20000);
+      const logPos = (Math.log10(p.freq) - logMin) / (logMax - logMin);
+      const barY = 50, barH = 8;
+      const marks = [20,50,100,200,500,1000,2000,5000,10000,20000];
+      marks.forEach(fr=>{
+        const t = (Math.log10(fr) - logMin) / (logMax - logMin);
+        const x = 10 + t * (W-20);
+        vline(x, barY-6, 6+barH+6, 1);
+        const lbl = fr >= 1000 ? (fr/1000)+'k' : String(fr);
+        drawTextCenter(lbl, x, barY+barH+4, 1, 0);
+      });
+      for(let i=0;i<W-20;i++){
+        const t = i/(W-20);
+        const on = t <= logPos;
+        for(let j=0;j<barH;j++) px(10+i, barY+j, on?3:1);
+      }
+      const cxp = 10 + logPos*(W-20);
+      vline(cxp, barY-4, barH+8, 6);
+      drawTextCenter(Math.round(p.freq) + ' Hz', W/2, 20, 3, 2);
+      drawTextCenter(p.auto ? 'AUTO' : 'MANUAL', W/2, 90, p.auto?5:2, 0);
+      drawTextCenter('SPEED ' + p.speed.toFixed(2), W/2, 102, 6, 0);
+      drawTextCenter(this.hint, W/2, 114, 1, 0);
+    },
+    onKey(k){
+      const p = svcEng.params;
+      if(k==='LEFT'){  p.freq = Math.max(20, p.freq/1.25); svcEng.osc.frequency.value = p.freq; seDn3(); }
+      if(k==='RIGHT'){ p.freq = Math.min(20000, p.freq*1.25); svcEng.osc.frequency.value = p.freq; seUp3(); }
+      if(k==='UP'){   p.speed = Math.min(5, p.speed+0.25); seUp3(); }
+      if(k==='DOWN'){ p.speed = Math.max(0.1, p.speed-0.25); seDn3(); }
+      if(k==='ENTER'){ p.auto = !p.auto; seNm3(); }
+    }
+  },
+
+  /* -------- 4. PINK NOISE + RTA -------- */
+  rta: {
+    name:'PINK + RTA', jp:'ピンクノイズ+分析',
+    hint:'[UD]音量 [ENT]ノイズ種 [ESC]戻る',
+    start(){
+      svcEng.begin();
+      svcEng.params = { noiseKind:'pink', vol:0.15 };
+      const n = svcEng.makeNoise('pink');
+      const g = svcEng.makeGain(0.15);
+      const ana = actx.createAnalyser();
+      ana.fftSize = 2048;
+      ana.smoothingTimeConstant = 0.7;
+      svcEng.add(ana);
+      svcEng.noise = n; svcEng.gain = g; svcEng.analyser = ana;
+      n.connect(g); g.connect(ana); ana.connect(actx.destination);
+      n.start();
+      svcEng.rtaData = new Uint8Array(ana.frequencyBinCount);
+    },
+    draw(f){
+      clearFB(0);
+      drawSvcHeader('PINK + RTA', this.jp);
+      const ana = svcEng.analyser;
+      if(!ana) return;
+      ana.getByteFrequencyData(svcEng.rtaData);
+      const nyq = actx.sampleRate / 2;
+      const centers = [];
+      for(let i=0;i<31;i++) centers.push(25 * Math.pow(2, i/3));
+      const barW = Math.floor((W-16) / 31);
+      for(let b=0;b<31;b++){
+        const fc = centers[b];
+        const lo = fc / Math.pow(2, 1/6);
+        const hi = fc * Math.pow(2, 1/6);
+        const i0 = Math.max(0, Math.floor(lo / nyq * ana.frequencyBinCount));
+        const i1 = Math.min(ana.frequencyBinCount-1, Math.floor(hi / nyq * ana.frequencyBinCount));
+        let sum = 0, cnt = 0;
+        for(let i=i0;i<=i1;i++){ sum += svcEng.rtaData[i]; cnt++; }
+        const v = cnt ? sum/cnt/255 : 0;
+        const bh = Math.max(1, Math.floor(v * 60));
+        const x = 8 + b*barW;
+        for(let j=0;j<bh;j++){
+          const c = j > 42 ? 4 : (j > 24 ? 6 : 3);
+          px(x, 74-j, c);
+          px(x+1, 74-j, c);
+          if(barW > 3) px(x+2, 74-j, c);
+        }
+        if(b % 5 === 0){
+          const lbl = fc >= 1000 ? (fc/1000).toFixed(fc%1000?1:0)+'k' : String(Math.round(fc));
+          drawTextCenter(lbl, x+barW/2, 78, 1, 0);
+        }
+      }
+      hline(8, 74, W-16, 2);
+      drawTextCenter(svcEng.params.noiseKind.toUpperCase() + ' NOISE', W/2, 20, 3, 1);
+      drawTextCenter('1/3 OCT  RTA  31 BAND', W/2, 32, 2, 0);
+      drawTextCenter(this.hint, W/2, 114, 1, 0);
+    },
+    onKey(k){
+      const p = svcEng.params;
+      if(k==='UP'){   p.vol = Math.min(0.4, p.vol+0.03); svcEng.gain.gain.value = p.vol; seUp3(); }
+      if(k==='DOWN'){ p.vol = Math.max(0.02, p.vol-0.03); svcEng.gain.gain.value = p.vol; seDn3(); }
+      if(k==='ENTER'){
+        p.noiseKind = (p.noiseKind === 'pink') ? 'white' : 'pink';
+        svcEng.noise.stop(); svcEng.noise.disconnect();
+        const n = svcEng.makeNoise(p.noiseKind);
+        n.connect(svcEng.gain);
+        svcEng.noise = n;
+        n.start();
+        seNm3();
+      }
+    }
+  },
+
+  /* -------- 5. CROSSOVER -------- */
+  crossover: {
+    name:'CROSSOVER', jp:'クロスオーバー',
+    hint:'[LR]周波数 [UD]HPF/LPF [ENT]ON/OFF [ESC]戻る',
+    start(){
+      svcEng.begin();
+      svcEng.params = { filterType:'lowpass', freq:1000, slope:12, on:true };
+      const n = svcEng.makeNoise('pink');
+      const f1 = actx.createBiquadFilter();
+      f1.type = 'lowpass'; f1.frequency.value = 1000; f1.Q.value = 0.7;
+      svcEng.add(f1);
+      const g = svcEng.makeGain(0.18);
+      svcEng.noise = n; svcEng.filter = f1; svcEng.gain = g;
+      n.connect(f1); f1.connect(g); g.connect(actx.destination);
+      n.start();
+    },
+    draw(f){
+      clearFB(0);
+      drawSvcHeader('CROSSOVER', this.jp);
+      const p = svcEng.params;
+      const logMin = Math.log10(20), logMax = Math.log10(20000);
+      const y0 = 30, yH = 60;
+      for(let fr of [100,1000,10000]){
+        const t = (Math.log10(fr)-logMin)/(logMax-logMin);
+        const x = 10 + t*(W-20);
+        vline(x, y0, yH, 1);
+        drawTextCenter(fr>=1000?(fr/1000)+'k':String(fr), x, y0+yH+2, 1, 0);
+      }
+      const fc = p.freq;
+      for(let i=0;i<W-20;i++){
+        const t = i/(W-20);
+        const freq = Math.pow(10, logMin + t*(logMax-logMin));
+        let gainDb;
+        if(p.filterType === 'lowpass'){
+          const oct = Math.log2(freq/fc);
+          gainDb = oct > 0 ? -oct * 12 : 0;
+        } else {
+          const oct = Math.log2(freq/fc);
+          gainDb = oct < 0 ? oct * 12 : 0;
+        }
+        const yy = y0 + yH/2 - Math.max(-50, Math.min(10, gainDb)) / 60 * yH;
+        px(10+i, yy, 3);
+      }
+      const fct = (Math.log10(fc)-logMin)/(logMax-logMin);
+      const fcx = 10 + fct*(W-20);
+      vline(fcx, y0, yH, 6);
+      drawTextCenter((p.filterType==='lowpass'?'LPF':'HPF'), W/2, 18, 3, 1);
+      drawTextCenter(Math.round(fc) + ' Hz  /  -' + p.slope + 'dB/oct', W/2, 96, 5, 0);
+      drawTextCenter(this.hint, W/2, 114, 1, 0);
+    },
+    onKey(k){
+      const p = svcEng.params;
+      if(k==='LEFT'){  p.freq = Math.max(20, p.freq/1.15); svcEng.filter.frequency.value = p.freq; seDn3(); }
+      if(k==='RIGHT'){ p.freq = Math.min(20000, p.freq*1.15); svcEng.filter.frequency.value = p.freq; seUp3(); }
+      if(k==='UP' || k==='DOWN'){
+        p.filterType = p.filterType==='lowpass'?'highpass':'lowpass';
+        svcEng.filter.type = p.filterType;
+        seNm3();
+      }
+      if(k==='ENTER'){
+        p.on = !p.on;
+        svcEng.filter.type = p.on ? p.filterType : 'allpass';
+        seNm3();
+      }
+    }
+  },
+
+  /* -------- 6. RING MOD -------- */
+  ringmod: {
+    name:'RING MOD', jp:'リングモジュレータ',
+    hint:'[LR]キャリア [UD]モジュレータ [ESC]戻る',
+    start(){
+      svcEng.begin();
+      svcEng.params = { carrier:440, modulator:30 };
+      const o1 = svcEng.makeOsc(440, 'sine');
+      const o2 = svcEng.makeOsc(30, 'sine');
+      const g = actx.createGain();
+      g.gain.value = 0;
+      svcEng.add(g);
+      const out = svcEng.makeGain(0.25);
+      svcEng.osc = o1; svcEng.osc2 = o2;
+      svcEng.modGain = g; svcEng.gain = out;
+      const gOsc2 = svcEng.makeGain(1);
+      o2.connect(gOsc2); gOsc2.connect(g.gain);
+      o1.connect(g); g.connect(out); out.connect(actx.destination);
+      o1.start(); o2.start();
+    },
+    draw(f){
+      clearFB(0);
+      drawSvcHeader('RING MOD', this.jp);
+      const p = svcEng.params;
+      const cx = W/2;
+      drawTextCenter('CARRIER ' + p.carrier + ' Hz', cx, 20, 3, 1);
+      drawTextCenter('MOD ' + p.modulator + ' Hz', cx, 32, 6, 1);
+      drawTextCenter('DIFF ' + Math.abs(p.carrier-p.modulator) + ' Hz  SUM '
+                     + (p.carrier+p.modulator) + ' Hz', cx, 48, 5, 0);
+      const y0 = 60;
+      for(let i=0;i<W-40;i++){
+        const t = i * 0.05;
+        const v = Math.sin(t*p.modulator*0.1) * Math.sin(t*p.carrier*0.1);
+        const yy = y0 + 20 - Math.round(v*18);
+        px(20+i, yy, 3);
+      }
+      hline(20, y0+20, W-40, 1);
+      drawTextCenter(this.hint, cx, 114, 1, 0);
+    },
+    onKey(k){
+      const p = svcEng.params;
+      if(k==='LEFT'){  p.carrier = Math.max(100, p.carrier-20); svcEng.osc.frequency.value = p.carrier; seDn3(); }
+      if(k==='RIGHT'){ p.carrier = Math.min(2000, p.carrier+20); svcEng.osc.frequency.value = p.carrier; seUp3(); }
+      if(k==='UP'){   p.modulator = Math.min(500, p.modulator+10); svcEng.osc2.frequency.value = p.modulator; seUp3(); }
+      if(k==='DOWN'){ p.modulator = Math.max(1, p.modulator-10); svcEng.osc2.frequency.value = p.modulator; seDn3(); }
+    }
+  },
+
+  /* -------- 7. DELAY -------- */
+  delay: {
+    name:'DELAY / ECHO', jp:'ディレイ',
+    hint:'[LR]時間 [UD]FB [ENT]ON/OFF [ESC]戻る',
+    start(){
+      svcEng.begin();
+      svcEng.params = { time:0.25, fb:0.4, on:true };
+      const g = svcEng.makeGain(1.0);
+      const delay = actx.createDelay(1.0);
+      delay.delayTime.value = 0.25;
+      const fb = actx.createGain(); fb.gain.value = 0.4;
+      const out = svcEng.makeGain(0.2);
+      svcEng.add(delay); svcEng.add(fb);
+      svcEng.gain = out; svcEng.delay = delay; svcEng.fb = fb;
+      const imp = svcEng.makeOsc(1500, 'square');
+      const impG = actx.createGain(); impG.gain.value = 0;
+      svcEng.add(impG);
+      imp.connect(impG); impG.connect(g);
+      g.connect(delay); g.connect(out);
+      delay.connect(fb); fb.connect(delay);
+      delay.connect(out);
+      out.connect(actx.destination);
+      imp.start();
+      svcEng.impG = impG;
+      svcEng.impInterval = setInterval(()=>{
+        if(!actx) return;
+        const t = actx.currentTime;
+        impG.gain.setValueAtTime(0.15, t);
+        impG.gain.setTargetAtTime(0, t+0.01, 0.005);
+      }, 800);
+    },
+    draw(f){
+      clearFB(0);
+      drawSvcHeader('DELAY / ECHO', this.jp);
+      const p = svcEng.params;
+      const y = 40;
+      const x0 = 10;
+      const total = W - 20;
+      fillRect(x0, y-4, 6, 8, 5);
+      drawTextCenter('SRC', x0+3, y-12, 5, 0);
+      const n = Math.min(10, Math.floor(1/Math.max(0.05,p.time)/2));
+      for(let i=1;i<=n;i++){
+        const t = i*p.time;
+        const x = x0 + (t / 1.0) * total;
+        if(x > W-10) break;
+        const att = Math.pow(p.fb, i);
+        const c = att > 0.5 ? 3 : (att > 0.2 ? 2 : 1);
+        const sz = Math.max(1, Math.round(att*6));
+        fillRect(x-2, y-sz/2, sz, sz, c);
+      }
+      hline(x0, y, total, 1);
+      drawTextCenter('TIME ' + p.time.toFixed(2) + ' s', W/2, 70, 3, 1);
+      drawTextCenter('FEEDBACK ' + Math.round(p.fb*100) + '%', W/2, 88, 6, 1);
+      drawTextCenter(p.on ? 'ON' : 'OFF', W/2, 104, p.on?5:4, 0);
+      drawTextCenter(this.hint, W/2, 114, 1, 0);
+    },
+    onKey(k){
+      const p = svcEng.params;
+      if(k==='LEFT'){  p.time = Math.max(0.05, p.time-0.05); svcEng.delay.delayTime.value = p.time; seDn3(); }
+      if(k==='RIGHT'){ p.time = Math.min(0.9, p.time+0.05); svcEng.delay.delayTime.value = p.time; seUp3(); }
+      if(k==='UP'){   p.fb = Math.min(0.9, p.fb+0.05); svcEng.fb.gain.value = p.fb; seUp3(); }
+      if(k==='DOWN'){ p.fb = Math.max(0, p.fb-0.05); svcEng.fb.gain.value = p.fb; seDn3(); }
+      if(k==='ENTER'){ p.on = !p.on; svcEng.fb.gain.value = p.on ? p.fb : 0; seNm3(); }
+    }
+  },
+
+  /* -------- 8. DISTORTION -------- */
+  distortion: {
+    name:'DISTORTION', jp:'歪み',
+    hint:'[LR]ドライブ [ESC]戻る',
+    start(){
+      svcEng.begin();
+      svcEng.params = { drive:30 };
+      const osc = svcEng.makeOsc(220, 'sine');
+      const shaper = actx.createWaveShaper();
+      const g = svcEng.makeGain(0.12);
+      svcEng.osc = osc; svcEng.shaper = shaper; svcEng.gain = g;
+      this._setCurve(30);
+      osc.connect(shaper); shaper.connect(g); g.connect(actx.destination);
+      osc.start();
+    },
+    _setCurve(k){
+      const n = 1024;
+      const curve = new Float32Array(n);
+      for(let i=0;i<n;i++){
+        const x = (i/(n-1))*2 - 1;
+        curve[i] = Math.tanh(x * k/10);
+      }
+      svcEng.shaper.curve = curve;
+    },
+    draw(f){
+      clearFB(0);
+      drawSvcHeader('DISTORTION', this.jp);
+      const p = svcEng.params;
+      const y0 = 40, amp = 30;
+      for(let i=0;i<W-20;i++){
+        const t = (i/(W-20)) * Math.PI * 8;
+        const raw = Math.sin(t);
+        const distorted = Math.tanh(raw * p.drive/10);
+        const yy = y0 + 30 - Math.round(distorted * amp);
+        px(10+i, yy, 3);
+        const yr = y0 + 30 - Math.round(raw * amp * 0.6);
+        if(i%2===0) px(10+i, yr, 1);
+      }
+      hline(10, y0+30, W-20, 1);
+      drawTextCenter('DRIVE ' + p.drive + '%', W/2, 18, 3, 1);
+      drawTextCenter(p.drive<20 ? 'CLEAN' : (p.drive<50 ? 'WARM' : (p.drive<80 ? 'CRUNCH' : 'FUZZ')),
+                     W/2, 90, 6, 1);
+      drawTextCenter(this.hint, W/2, 114, 1, 0);
+    },
+    onKey(k){
+      const p = svcEng.params;
+      if(k==='LEFT'){  p.drive = Math.max(1, p.drive-5); this._setCurve(p.drive); seDn3(); }
+      if(k==='RIGHT'){ p.drive = Math.min(100, p.drive+5); this._setCurve(p.drive); seUp3(); }
+    }
+  },
+
+  /* -------- 9. REVERB -------- */
+  reverb: {
+    name:'REVERB', jp:'リバーブ',
+    hint:'[LR]部屋サイズ [ENT]ON/OFF [ESC]戻る',
+    start(){
+      svcEng.begin();
+      svcEng.params = { room:1, on:true };
+      const osc = svcEng.makeOsc(300, 'square');
+      const conv = actx.createConvolver();
+      svcEng.osc = osc; svcEng.conv = conv;
+      this._setIR(1);
+      const dry = svcEng.makeGain(0.08);
+      const wet = svcEng.makeGain(0.3);
+      svcEng.dry = dry; svcEng.wet = wet;
+      osc.connect(dry); dry.connect(actx.destination);
+      osc.connect(conv); conv.connect(wet); wet.connect(actx.destination);
+      osc.start();
+      const lfo = svcEng.makeOsc(2.5, 'square');
+      const lfoG = svcEng.makeGain(0.05);
+      lfo.connect(lfoG); lfoG.connect(dry.gain); lfoG.connect(wet.gain);
+      lfo.start();
+    },
+    _setIR(idx){
+      const dur = [0.3, 0.8, 2.5][idx];
+      const rate = actx.sampleRate;
+      const len = Math.floor(dur * rate);
+      const buf = actx.createBuffer(2, len, rate);
+      for(let ch=0;ch<2;ch++){
+        const d = buf.getChannelData(ch);
+        for(let i=0;i<len;i++){
+          const t = i/len;
+          d[i] = (Math.random()*2-1) * Math.pow(1-t, idx+1.5);
+        }
+      }
+      svcEng.conv.buffer = buf;
+    },
+    draw(f){
+      clearFB(0);
+      drawSvcHeader('REVERB', this.jp);
+      const p = svcEng.params;
+      const names = ['SMALL','MEDIUM','HALL'];
+      drawTextCenter(names[p.room], W/2, 20, 3, 2);
+      const cy = 70;
+      const sz = [40, 70, 110][p.room];
+      rectOutline(W/2-sz, cy-sz/2, sz*2, sz, 2);
+      for(let a=0;a<Math.PI*2;a+=0.3)
+        px(W/2+Math.cos(a)*4, cy+Math.sin(a)*4, 5);
+      for(let i=0;i<4;i++){
+        const r = ((f*2 + i*25) % 100);
+        if(r > sz) continue;
+        for(let a=0;a<Math.PI*2;a+=0.2){
+          px(W/2+Math.cos(a)*r, cy+Math.sin(a)*r*0.5, 3);
+        }
+      }
+      drawTextCenter(p.on ? 'ON' : 'OFF', W/2, 104, p.on?5:4, 0);
+      drawTextCenter(this.hint, W/2, 114, 1, 0);
+    },
+    onKey(k){
+      const p = svcEng.params;
+      if(k==='LEFT'){  p.room = Math.max(0, p.room-1); this._setIR(p.room); seDn3(); }
+      if(k==='RIGHT'){ p.room = Math.min(2, p.room+1); this._setIR(p.room); seUp3(); }
+      if(k==='ENTER'){ p.on = !p.on;
+        svcEng.wet.gain.value = p.on ? 0.3 : 0;
+        svcEng.dry.gain.value = p.on ? 0.08 : 0.15;
+        seNm3();
+      }
+    }
+  },
+
+  /* -------- 10. SPEAKER TEST -------- */
+  speakers: {
+    name:'SPEAKER TEST', jp:'SPテスト',
+    hint:'[LR]ch切替 [ENT]再鳴動 [ESC]戻る',
+    start(){
+      svcEng.begin();
+      svcEng.params = { idx:0 };
+      this._ping(0);
+    },
+    _ping(i){
+      svcEng.params.idx = i;
+      // 発音ノードだけ差し替え（既存は停止）
+      for(const n of svcEng.nodes){
+        try{ if(n.stop) n.stop(); }catch(e){}
+        try{ n.disconnect(); }catch(e){}
+      }
+      svcEng.nodes = [];
+      const ch = [
+        { name:'FRONT L',   freq:1000, pan:-0.9 },
+        { name:'FRONT R',   freq:1000, pan: 0.9 },
+        { name:'REAR L',    freq:1000, pan:-0.9 },
+        { name:'REAR R',    freq:1000, pan: 0.9 },
+        { name:'SUB WOOFER',freq:60,  pan: 0.0 },
+      ][i];
+      const o = svcEng.makeOsc(ch.freq, ch.freq<100?'sine':'square');
+      const p = svcEng.makePan(ch.pan);
+      const g = svcEng.makeGain(0);
+      o.connect(p); p.connect(g); g.connect(actx.destination);
+      o.start();
+      const t = actx.currentTime;
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(0.18, t+0.02);
+      g.gain.setValueAtTime(0.18, t+0.6);
+      g.gain.linearRampToValueAtTime(0, t+0.75);
+    },
+    draw(f){
+      clearFB(0);
+      drawSvcHeader('SPEAKER TEST', this.jp);
+      const idx = svcEng.params.idx;
+      const cx = W/2, cy = 55;
+      rectOutline(cx-80, cy-22, 160, 44, 1);
+      hline(cx-80, cy+8, 160, 1);
+      const pos = [[cx-70, cy-14],[cx+70, cy-14],[cx-70, cy+14],[cx+70, cy+14]];
+      const pulse = (Math.floor(f/3)%2)===0;
+      for(let i=0;i<4;i++){
+        const [x,y] = pos[i];
+        const on = (idx === i);
+        const c = on ? (pulse?5:6) : 2;
+        for(let a=0;a<Math.PI*2;a+=0.4)
+          px(x+Math.cos(a)*5, y+Math.sin(a)*5, c);
+        px(x, y, on?3:1);
+      }
+      if(idx === 4){
+        for(let a=0;a<Math.PI*2;a+=0.4)
+          px(cx+Math.cos(a)*10, cy+Math.sin(a)*10, pulse?4:6);
+      }
+      const names = ['FRONT L','FRONT R','REAR L','REAR R','SUB WOOFER'];
+      drawTextCenter(names[idx], W/2, 88, 3, 1);
+      drawTextCenter((idx+1) + ' / 5', W/2, 100, 2);
+      drawTextCenter(this.hint, W/2, 114, 1, 0);
+    },
+    onKey(k){
+      const idx = svcEng.params.idx;
+      if(k==='LEFT'){  this._ping((idx+4)%5); seDn3(); }
+      if(k==='RIGHT'){ this._ping((idx+1)%5); seUp3(); }
+      if(k==='ENTER'){ this._ping(idx); seNm3(); }
+    }
+  },
+
+  /* -------- 11. VOCAL ELIM -------- */
+  vocancel: {
+    name:'VOCAL ELIM', jp:'ボーカルキャンセル',
+    hint:'[ENT]ON/OFF [ESC]戻る',
+    start(){
+      svcEng.begin();
+      svcEng.params = { on:false };
+      if(audioEl.src && state.discIn && playlist.length){
+        audioEl.play().catch(()=>{});
+        svcEng.resumeMusic = false;
+      }
+      if(mediaSrc && actx){
+        const split = actx.createChannelSplitter(2);
+        const merge = actx.createChannelMerger(2);
+        const gL = actx.createGain(); gL.gain.value = 1;
+        const gR = actx.createGain(); gR.gain.value = 1;
+        const invR = actx.createGain(); invR.gain.value = 0;
+        svcEng.add(split); svcEng.add(merge); svcEng.add(gL); svcEng.add(gR); svcEng.add(invR);
+        try{ mediaSrc.disconnect(); }catch(e){}
+        mediaSrc.connect(split);
+        split.connect(gL, 0);
+        split.connect(gR, 1);
+        gL.connect(merge, 0, 0);
+        gR.connect(invR); invR.connect(merge, 0, 0);
+        gR.connect(merge, 0, 1);
+        merge.connect(masterGain);
+        svcEng.vocalInvR = invR;
+        svcEng.vocalMerge = merge;
+      }
+    },
+    stop(){
+      try{
+        if(mediaSrc){
+          mediaSrc.disconnect();
+          mediaSrc.connect(masterGain);
+        }
+      }catch(e){}
+    },
+    draw(f){
+      clearFB(0);
+      drawSvcHeader('VOCAL ELIM', this.jp);
+      const p = svcEng.params;
+      const cx = W/2;
+      const y = 55;
+      drawTextCenter('L', cx-90, y, 2, 1);
+      drawTextCenter('C', cx, y, p.on?4:5, 1);
+      drawTextCenter('R', cx+90, y, 2, 1);
+      if(p.on){
+        for(let i=-10;i<=10;i++){
+          px(cx+i, y+i, 4);
+          px(cx+i, y-i, 4);
+        }
+      }
+      drawTextCenter(p.on ? 'CENTER CANCELLED' : 'NORMAL STEREO',
+                     cx, 20, p.on?4:5, 1);
+      drawTextCenter(p.on ? '(Vocals reduced)' : '(Full stereo)',
+                     cx, 90, 2, 0);
+      if(!audioEl.src) drawTextCenter('NO TRACK LOADED', cx, 105, 1);
+      drawTextCenter(this.hint, cx, 114, 1, 0);
+    },
+    onKey(k){
+      if(k==='ENTER'){
+        const p = svcEng.params;
+        p.on = !p.on;
+        if(svcEng.vocalInvR) svcEng.vocalInvR.gain.value = p.on ? -1 : 0;
+        seNm3();
+      }
+    }
+  },
+
+  /* -------- 12. BASS BOOST -------- */
+  bassboost: {
+    name:'BASS BOOST', jp:'低音ブースト',
+    hint:'[LR]周波数 [UD]ゲイン [ENT]ON/OFF [ESC]戻る',
+    start(){
+      svcEng.begin();
+      svcEng.params = { freq:60, gain:10, on:true };
+      const osc = svcEng.makeOsc(80, 'sawtooth');
+      const filt = actx.createBiquadFilter();
+      filt.type = 'lowshelf';
+      filt.frequency.value = 60;
+      filt.gain.value = 10;
+      svcEng.add(filt);
+      const g = svcEng.makeGain(0.15);
+      svcEng.osc = osc; svcEng.filter = filt; svcEng.gain = g;
+      osc.connect(filt); filt.connect(g); g.connect(actx.destination);
+      osc.start();
+    },
+    draw(f){
+      clearFB(0);
+      drawSvcHeader('BASS BOOST', this.jp);
+      const p = svcEng.params;
+      const logMin = Math.log10(20), logMax = Math.log10(2000);
+      const y0 = 40, yH = 60;
+      for(let i=0;i<W-20;i++){
+        const t = i/(W-20);
+        const fr = Math.pow(10, logMin + t*(logMax-logMin));
+        let db = 0;
+        if(fr <= p.freq) db = p.gain;
+        else if(fr < p.freq*2) db = p.gain * (1 - (fr - p.freq)/p.freq);
+        const yy = y0 + yH/2 - db/20 * (yH/2);
+        px(10+i, yy, 3);
+      }
+      hline(10, y0+yH/2, W-20, 1);
+      drawTextCenter('FREQ ' + p.freq + ' Hz', W/2, 18, 3, 1);
+      drawTextCenter('GAIN ' + (p.gain>0?'+':'') + p.gain + ' dB', W/2, 100, 6, 1);
+      drawTextCenter(p.on ? 'ON' : 'OFF', W/2, 114, p.on?5:4, 0);
+    },
+    onKey(k){
+      const p = svcEng.params;
+      if(k==='LEFT'){  p.freq = Math.max(30, p.freq-10); svcEng.filter.frequency.value = p.freq; seDn3(); }
+      if(k==='RIGHT'){ p.freq = Math.min(300, p.freq+10); svcEng.filter.frequency.value = p.freq; seUp3(); }
+      if(k==='UP'){   p.gain = Math.min(20, p.gain+2); svcEng.filter.gain.value = p.on ? p.gain : 0; seUp3(); }
+      if(k==='DOWN'){ p.gain = Math.max(-12, p.gain-2); svcEng.filter.gain.value = p.on ? p.gain : 0; seDn3(); }
+      if(k==='ENTER'){ p.on = !p.on; svcEng.filter.gain.value = p.on ? p.gain : 0; seNm3(); }
+    }
+  },
+
+  /* -------- 13. COMPRESSOR -------- */
+  compressor: {
+    name:'COMPRESSOR', jp:'コンプレッサ',
+    hint:'[LR]しきい値 [UD]レシオ [ESC]戻る',
+    start(){
+      svcEng.begin();
+      svcEng.params = { thr:-20, ratio:4 };
+      const osc = svcEng.makeOsc(220, 'sine');
+      const env = svcEng.makeOsc(0.8, 'sine');
+      const envG = svcEng.makeGain(0.15);
+      const comp = actx.createDynamicsCompressor();
+      comp.threshold.value = -20;
+      comp.ratio.value = 4;
+      comp.attack.value = 0.005;
+      comp.release.value = 0.15;
+      svcEng.add(comp);
+      const g = svcEng.makeGain(0.25);
+      svcEng.osc = osc; svcEng.comp = comp; svcEng.gain = g;
+      osc.connect(g);
+      env.connect(envG); envG.connect(g.gain);
+      g.connect(comp); comp.connect(actx.destination);
+      osc.start(); env.start();
+    },
+    draw(f){
+      clearFB(0);
+      drawSvcHeader('COMPRESSOR', this.jp);
+      const p = svcEng.params;
+      const y0 = 30, yH = 60;
+      const x0 = 20, xW = W-40;
+      rectOutline(x0-1, y0-1, xW+2, yH+2, 1);
+      for(let i=0;i<xW;i++) px(x0+i, y0+yH - (i/xW)*yH, 1);
+      for(let i=0;i<xW;i++){
+        const inDb = (i/xW) * 40 - 40;
+        let outDb;
+        if(inDb < p.thr) outDb = inDb;
+        else outDb = p.thr + (inDb - p.thr)/p.ratio;
+        const yy = y0 + yH - ((outDb+40)/40) * yH;
+        px(x0+i, yy, 3);
+      }
+      const gr = svcEng.comp ? -svcEng.comp.reduction : 0;
+      const grX = x0 + ((p.thr+40)/40) * xW;
+      vline(grX, y0, yH, 6);
+      drawTextCenter('IN/OUT CURVE', W/2, 18, 2, 0);
+      drawTextCenter('THR ' + p.thr + 'dB  RATIO ' + p.ratio.toFixed(1) + ':1',
+                     W/2, 98, 3, 0);
+      drawTextCenter('GR ' + gr.toFixed(1) + ' dB',
+                     W/2, 110, gr > 3 ? 4 : 2, 0);
+      drawTextCenter(this.hint, W/2, 114, 1, 0);
+    },
+    onKey(k){
+      const p = svcEng.params;
+      if(k==='LEFT'){  p.thr = Math.max(-60, p.thr-2); svcEng.comp.threshold.value = p.thr; seDn3(); }
+      if(k==='RIGHT'){ p.thr = Math.min(0, p.thr+2); svcEng.comp.threshold.value = p.thr; seUp3(); }
+      if(k==='UP'){   p.ratio = Math.min(20, p.ratio+1); svcEng.comp.ratio.value = p.ratio; seUp3(); }
+      if(k==='DOWN'){ p.ratio = Math.max(1, p.ratio-1); svcEng.comp.ratio.value = p.ratio; seDn3(); }
+    }
+  },
+
+  /* -------- 14. REF TONE -------- */
+  reference: {
+    name:'REF TONE', jp:'基準音',
+    hint:'[LR]周波数 [UD]音量 [ESC]戻る',
+    start(){
+      svcEng.begin();
+      svcEng.params = { idx:0, vol:0.15 };
+      const freqs = [1000, 100, 40, 400, 10000, 15000];
+      const o = svcEng.makeOsc(freqs[0], 'sine');
+      const g = svcEng.makeGain(0.15);
+      svcEng.osc = o; svcEng.gain = g;
+      o.connect(g); g.connect(actx.destination);
+      o.start();
+    },
+    draw(f){
+      clearFB(0);
+      drawSvcHeader('REF TONE', this.jp);
+      const p = svcEng.params;
+      const freqs = [1000, 100, 40, 400, 10000, 15000];
+      const names = ['1kHz (REF)','100Hz','40Hz','400Hz','10kHz','15kHz'];
+      for(let i=0;i<freqs.length;i++){
+        const y = 30 + i*12;
+        const sel = i === p.idx;
+        if(sel) fillRect(6, y-2, W-12, 11, 3);
+        drawText((sel?'> ':'  ') + names[i], 10, y, sel?0:2, 0);
+        drawTextRight(freqs[i] + ' Hz', W-10, y, sel?0:1, 0);
+      }
+      const barY = H-20;
+      drawText('VOL', 4, barY-8, 1, 0);
+      for(let i=0;i<W-40;i++){
+        const on = (i/(W-40)) < p.vol/0.4;
+        const c = on ? (i>W-60?4:(i>W-80?6:5)) : 1;
+        px(20+i, barY, c);
+        px(20+i, barY+1, c);
+      }
+      rectOutline(19, barY-1, W-38, 4, 1);
+      drawTextCenter(this.hint, W/2, H-8, 1, 0);
+    },
+    onKey(k){
+      const p = svcEng.params;
+      const freqs = [1000, 100, 40, 400, 10000, 15000];
+      if(k==='LEFT'){  p.idx = (p.idx+5)%6; svcEng.osc.frequency.value = freqs[p.idx]; seDn3(); }
+      if(k==='RIGHT'){ p.idx = (p.idx+1)%6; svcEng.osc.frequency.value = freqs[p.idx]; seUp3(); }
+      if(k==='UP'){   p.vol = Math.min(0.4, p.vol+0.03); svcEng.gain.gain.value = p.vol; seUp3(); }
+      if(k==='DOWN'){ p.vol = Math.max(0.02, p.vol-0.03); svcEng.gain.gain.value = p.vol; seDn3(); }
+    }
+  },
+
+  /* -------- 15. SWEEP & HOLD -------- */
+  swhold: {
+    name:'SWEEP & HOLD', jp:'スイープ&ホールド',
+    hint:'[ENT]ホールド [LR]微調整 [ESC]戻る',
+    start(){
+      svcEng.begin();
+      svcEng.params = { freq:100, hold:false, dir:1 };
+      const o = svcEng.makeOsc(100, 'sine');
+      const g = svcEng.makeGain(0.15);
+      svcEng.osc = o; svcEng.gain = g;
+      o.connect(g); g.connect(actx.destination);
+      o.start();
+    },
+    draw(f){
+      clearFB(0);
+      drawSvcHeader('SWEEP & HOLD', this.jp);
+      const p = svcEng.params;
+      if(!p.hold){
+        p.freq *= Math.pow(10, p.dir * 0.03);
+        if(p.freq > 18000){ p.freq = 18000; p.dir = -1; }
+        if(p.freq < 30){ p.freq = 30; p.dir = 1; }
+        svcEng.osc.frequency.value = p.freq;
+      }
+      const logMin = Math.log10(20), logMax = Math.log10(20000);
+      const lp = (Math.log10(p.freq) - logMin) / (logMax - logMin);
+      const cx = 10 + lp*(W-20);
+      const y0 = 40;
+      for(let i=0;i<W-20;i++){
+        const t = i * 0.08;
+        const v = Math.sin(t * (1 + lp*4));
+        px(10+i, y0 + 20 - Math.round(v*15), 2);
+      }
+      hline(10, y0+20, W-20, 1);
+      vline(cx, y0, 40, 6);
+      drawTextCenter(Math.round(p.freq) + ' Hz', W/2, 20, p.hold?5:3, 2);
+      drawTextCenter(p.hold ? 'HOLD' : 'SWEEPING', W/2, 90, p.hold?5:1, 1);
+      drawTextCenter(this.hint, W/2, 114, 1, 0);
+    },
+    onKey(k){
+      const p = svcEng.params;
+      if(k==='ENTER'){ p.hold = !p.hold; seNm3(); }
+      if(k==='LEFT'){  p.freq = Math.max(20, p.freq/1.05); svcEng.osc.frequency.value = p.freq; seDn3(); }
+      if(k==='RIGHT'){ p.freq = Math.min(20000, p.freq*1.05); svcEng.osc.frequency.value = p.freq; seUp3(); }
+    }
+  },
+};
+
+function svcOpen(id){
+  if(svcEng.active && SVC_TESTS[svcEng.active] && SVC_TESTS[svcEng.active].stop){
+    try{ SVC_TESTS[svcEng.active].stop(); }catch(e){}
+  }
+  svcEng.stop();
+  const t = SVC_TESTS[id];
+  if(!t) return;
+  state.svcId = id;
+  state.screen = 'svctest';
+  try{ t.start(); }catch(e){ console.log(e); }
+  svcEng.active = id;
+}
+function drawSvcHeader(title, jp){
+  fillRect(0,0,W,STATUS_H,2);
+  drawText(title, 4, 4, 3, 0);
+  drawTextRight(jp || '', W-4, 4, 6, 0);
+  hline(0, STATUS_H-1, W, 3);
+}
+
+/* ==========================================================================
+   ENGINE LOADER (JS Plugin API)
+   ========================================================================== */
+const engineScreens = new Map();   // id -> { draw(f), onKey(k) }
+const engineMenuRefs = [];         // 動的に service メニューに足す項目
+
+function enginePickFile(){
+  const inp = document.createElement('input');
+  inp.type = 'file';
+  inp.accept = '.js,application/javascript,text/javascript';
+  inp.onchange = (e)=>{
+    const f = e.target.files && e.target.files[0];
+    if(f) engineLoadFile(f);
+  };
+  inp.click();
+}
+
+function createEngineAPI(){
+  let pluginId = 'plugin_' + Date.now().toString(36);
+  return {
+    version: '3.50',
+    id: pluginId,
+    W, H, PW, PH,
+    // ---- 直接 state アクセス（意図的に公開） ----
+    state,
+    // ---- メニュー ----
+    menu: {
+      // サービストップに項目を追加
+      add(item){
+        const target = MENUS.service;
+        target.items.push({
+          t: 'act',
+          label: item.label || 'PLUGIN',
+          labelJp: item.labelJp || item.label || 'プラグイン',
+          act: ()=>{ if(item.onActivate) item.onActivate(); }
+        });
+      }
+    },
+    // ---- 画面 ----
+    screen: {
+      // カスタム画面を表示 { draw(f), onKey(k) }
+      show(id, defs){
+        engineScreens.set(id, defs || {});
+        state.customScreen = { id };
+        state.screen = 'custom';
+      },
+      close(){
+        state.customScreen = null;
+        state.screen = 'menu';
+      }
+    },
+    // ---- 描画 ----
+    draw: {
+      clear(v){ clearFB(v|0); },
+      pixel(x,y,c){ px(x,y,c); },
+      rect(x,y,w,h,c){ fillRect(x,y,w,h,c); },
+      outline(x,y,w,h,c){ rectOutline(x,y,w,h,c); },
+      line(x0,y0,x1,y1,c){ line3([x0,y0],[x1,y1],c); },
+      text(x,y,s,c,sp){ drawText(String(s), x, y, c|0, sp); },
+      textCenter(x,y,s,c,sp){ drawTextCenter(String(s), x, y, c|0, sp); },
+      textRight(x,y,s,c,sp){ drawTextRight(String(s), x, y, c|0, sp); },
+      textBig(x,y,s,c,sc,sp){ drawTextBig(String(s), x, y, c|0, sc, sp); },
+      hline(x,y,w,c){ hline(x,y,w,c); },
+      vline(x,y,h,c){ vline(x,y,h,c); },
+      setClip(x,y,w,h){ setClip(x,y,w,h); },
+      resetClip(){ resetClip(); },
+      palette(i){ return (THEMES[state.theme].pal[i|0] || [0,0,0]).slice(); },
+    },
+    // ---- オーディオ ----
+    audio: {
+      ctx(){ return actx; },
+      spectrum(n){ return Array.from(getSpectrum(n|0)); },
+      wave(n){ return Array.from(getWave(n|0)); },
+      // 単発トーン
+      tone(freq, dur, type, vol){
+        if(!actx) return;
+        try{
+          const t = actx.currentTime;
+          const o = actx.createOscillator(), g = actx.createGain();
+          o.type = type || 'sine';
+          o.frequency.value = freq;
+          g.gain.setValueAtTime(0.0001, t);
+          g.gain.exponentialRampToValueAtTime(vol || 0.15, t+0.01);
+          g.gain.exponentialRampToValueAtTime(0.0001, t+dur);
+          o.connect(g); g.connect(actx.destination);
+          o.start(t); o.stop(t+dur+0.02);
+        }catch(e){}
+      },
+      // 定位付きトーン
+      panTone(freq, dur, pan, vol){
+        if(!actx) return;
+        try{
+          const t = actx.currentTime;
+          const o = actx.createOscillator();
+          const p = actx.createStereoPanner();
+          const g = actx.createGain();
+          o.type = 'sine'; o.frequency.value = freq;
+          p.pan.value = pan;
+          g.gain.setValueAtTime(0.0001, t);
+          g.gain.exponentialRampToValueAtTime(vol || 0.15, t+0.01);
+          g.gain.exponentialRampToValueAtTime(0.0001, t+dur);
+          o.connect(p); p.connect(g); g.connect(actx.destination);
+          o.start(t); o.stop(t+dur+0.02);
+        }catch(e){}
+      }
+    },
+    // ---- 効果音 ----
+    se: {
+      up: ()=>seUp3(),
+      dn: ()=>seDn3(),
+      ok: ()=>seNm3(),
+      boot: ()=>seBt5(),
+      shutdown: ()=>seSd5(),
+    },
+    // ---- 入力 ----
+    input: {
+      onKey(fn){ engineScreens.get(pluginId) || 0; state._engineKeyHandlers = state._engineKeyHandlers || []; state._engineKeyHandlers.push(fn); return fn; },
+      off(fn){ if(state._engineKeyHandlers){ const i = state._engineKeyHandlers.indexOf(fn); if(i>=0) state._engineKeyHandlers.splice(i,1); } }
+    },
+    // ---- ストレージ（名前空間付き） ----
+    store: {
+      get(k){ try{ return JSON.parse(localStorage.getItem('PAA_ENG_' + k) || 'null'); }catch(e){ return null; } },
+      set(k,v){ try{ localStorage.setItem('PAA_ENG_' + k, JSON.stringify(v)); }catch(e){} },
+      del(k){ try{ localStorage.removeItem('PAA_ENG_' + k); }catch(e){} }
+    },
+    // ---- ユーティリティ ----
+    L, T, clamp, lerp, pad2, fmtTime, timeStr,
+    log(){ try{ console.log.apply(console, ['[PAA-ENG]'].concat(Array.from(arguments))); }catch(e){} },
+  };
+}
+
+function engineLoadFile(file){
+  const reader = new FileReader();
+  reader.onload = ()=>{
+    try{
+      const src = String(reader.result);
+      const api = createEngineAPI();
+      const fn = new Function('PAA', 'console', '"use strict";\n' + src);
+      fn(api, { log: api.log, warn: api.log, error: api.log });
+      // プラグイン名をスクリプトから抽出できなければファイル名を使う
+      const name = (src.match(/@name\s+([^\n*]+)/) || [, file.name.replace(/\.js$/,'')])[1].trim();
+      const version = (src.match(/@version\s+([^\n*]+)/) || [,'1.0'])[1].trim();
+      state.enginePlugins.push({
+        id: api.id,
+        name: name.slice(0,28),
+        version: version.slice(0,10),
+        items: [],
+      });
+      seBt5();
+      svcStub('ENGINE', 'LOADED: ' + name);
+    }catch(e){
+      errLog.unshift({ t:new Date(), msg:'ENGINE: ' + String(e.message||e).slice(0,36) });
+      svcStub('ENGINE', 'LOAD ERROR');
+      seSd5();
+    }
+  };
+  reader.readAsText(file);
+}
 
 /* ==========================================================================
    9. HELPERS
@@ -3109,7 +4964,142 @@ function hash1(i){
   return (i>>>0)/4294967296;
 }
 function L(en, jp){ return state.lang === 1 ? jp : en; }
+/* ==========================================================================
+   SOURCE SWITCH RING SELECTOR
+   ========================================================================== */
+const SRC_RING_LIST = ['CD','MD','FM','AM','AUX'];
+const SRC_RING_ICON = { CD:'disc', MD:'md', FM:'wave', AM:'tower', AUX:'plug' };
 
+/* ソースアイコン */
+function drawSrcIcon(kind, cx, cy, r, c){
+  cx = Math.round(cx); cy = Math.round(cy); r = Math.max(2, Math.round(r));
+  switch(kind){
+    case 'disc':   // CD
+      for(let a=0;a<Math.PI*2;a+=0.18) px(cx+Math.cos(a)*r, cy+Math.sin(a)*r, c);
+      for(let a=0;a<Math.PI*2;a+=0.22)
+        px(cx+Math.cos(a)*Math.max(1,Math.floor(r/2)),
+           cy+Math.sin(a)*Math.max(1,Math.floor(r/2)), c);
+      px(cx, cy, c);
+      break;
+    case 'md':     // MD
+      rectOutline(cx-r, cy-r+1, r*2+1, r*2-1, c);
+      for(let a=0;a<Math.PI*2;a+=0.30)
+        px(cx+Math.cos(a)*Math.max(1, r-2),
+           cy+Math.sin(a)*Math.max(1, r-2), c);
+      break;
+    case 'wave':   // FM
+      px(cx-2, cy, c);
+      for(let a=-1.0;a<=1.0;a+=0.14)
+        px(cx-2+Math.cos(a)*Math.max(2,r-1),
+           cy+Math.sin(a)*Math.max(2,r-1), c);
+      for(let a=-0.9;a<=0.9;a+=0.14)
+        px(cx-2+Math.cos(a)*Math.max(3,r+1),
+           cy+Math.sin(a)*Math.max(3,r+1), c);
+      break;
+    case 'tower':  // AM
+      vline(cx, cy-r, r*2+1, c);
+      hline(cx-r, cy-r, r*2+1, c);
+      hline(cx-r, cy+r, r*2+1, c);
+      hline(cx-r, cy, r*2+1, c);
+      break;
+    case 'plug':   // AUX
+      for(let a=0;a<Math.PI*2;a+=0.30)
+        px(cx+Math.cos(a)*Math.max(2, r-1),
+           cy+Math.sin(a)*Math.max(2, r-1), c);
+      px(cx-1, cy-1, c); px(cx, cy-1, c); px(cx+1, cy-1, c);
+      px(cx, cy+1, c);
+      break;
+  }
+}
+
+/* 画面下部の控えめな3層ウェーブ */
+const SRC_WAVE_LAYERS = [
+  { baseY: 84,  amp: 2.0, freq: 0.026, spd: -0.030, fill: 0, line: 1 },
+  { baseY: 96,  amp: 2.6, freq: 0.032, spd:  0.040, fill: 1, line: 2 },
+  { baseY: 108, amp: 3.2, freq: 0.038, spd: -0.050, fill: 1, line: 3 },
+];
+function srcWaveAt(x, L, f){
+  const t = x * L.freq;
+  return (
+      Math.sin(t*1.00 + f*L.spd)             * L.amp
+    + Math.sin(t*2.31 - f*L.spd*1.2 + 0.7)   * L.amp * 0.32
+    + Math.sin(t*4.87 + f*L.spd*0.6 + 1.3)   * L.amp * 0.14
+  );
+}
+function drawSrcWave(){
+  const f = state.frame;
+  for(let li = 0; li < SRC_WAVE_LAYERS.length; li++){
+    const L = SRC_WAVE_LAYERS[li];
+    if(L.fill > 0){
+      for(let x = 0; x < W; x++){
+        const y = Math.round(L.baseY + srcWaveAt(x, L, f));
+        for(let yy = y + 1; yy < H; yy++) px(x, yy, L.fill);
+      }
+    }
+    for(let x = 0; x < W; x++){
+      const y = Math.round(L.baseY + srcWaveAt(x, L, f));
+      pset(x, y, L.line);
+    }
+  }
+}
+
+/* リング本体 */
+function drawSourceRing(){
+  clearFB(0);
+  drawSrcWave();
+
+  const cx = W/2;
+  const cy = 48;
+  const Rx = 155;
+  const dA = 0.55;
+  const o  = state.selOffset;
+  const n  = SRC_RING_LIST.length;
+
+  /* リング状の相対位置を計算 */
+  const items = [];
+  for(let idx = 0; idx < n; idx++){
+    let rel = idx - o;
+    while(rel >  n/2) rel -= n;
+    while(rel < -n/2) rel += n;
+    items.push({
+      idx, rel,
+      name: SRC_RING_LIST[idx],
+      icon: SRC_RING_ICON[SRC_RING_LIST[idx]]
+    });
+  }
+  items.sort((a,b) => Math.abs(b.rel) - Math.abs(a.rel));
+
+  /* リングガイド（薄い楕円） */
+  for(let a=0; a<Math.PI*2; a+=0.06){
+    const x = cx + Rx * Math.sin(a);
+    const y = cy + Math.sin(a*0.5) * 5;
+    if(y > H - 26) continue;
+    if(y < 6) continue;
+    px(x, y, 1);
+  }
+
+  /* 各ソースをリング上に配置 */
+  for(const it of items){
+    const th = -it.rel * dA;
+    const sz = Math.cos(th);
+    if(sz < -0.25) continue;
+    const sx = cx + Rx * Math.sin(th) * (0.55 + 0.45*Math.max(0,sz));
+    const sy = cy - 6 * sz;
+    const sc = 0.30 + 0.70 * Math.max(0, sz);
+    const br = sz > 0.55 ? 5 : (sz > 0.10 ? 3 : (sz > -0.15 ? 2 : 1));
+    const r  = Math.max(3, Math.round(10 * sc));
+
+    /* アイコン（テキストの上） */
+    drawSrcIcon(it.icon, sx, sy - 18*sc, r, br);
+
+    /* ラベル（中央寄りだけ表示） */
+    if(sz > 0.05){
+      const fs  = Math.max(1, Math.round(sc * 2));
+      const tw_ = tw(it.name, 1) * fs;
+      drawTextBig(it.name, Math.round(sx - tw_/2), Math.round(sy + 5), br, fs, 1);
+    }
+  }
+}
 /* 画面遷移：そのまま切り替える（残像は glowBuf の自然減衰が担当） */
 let fadeSnap = null;
 let fadeT = 0;
@@ -3396,10 +5386,13 @@ function drawMain(){
   const vizIdx = state.viz;
   const hasViz = vizIdx >= 0 && vizIdx < VIZ_FUNCS.length-1 && VIZ_FUNCS[vizIdx];
 
-  // ビジュアライザーを最下層レイヤーとして画面全体に描画
-  // （上下バンドの裏側に配置される）
+  // ビジュアライザーを最下層レイヤーとして描画
+  // 上下のUIバンド領域には一切描かせない（グロー残光の貫通を防ぐ）
+  // ビジュアライザーは上下のUIバンド（STATUS_H / INFO_H）の内側だけに描画
   if(isDisc && state.discIn && playlist.length && hasViz && page === 1){
+    setClip(0, STATUS_H, W, H - STATUS_H - INFO_H);
     VIZ_FUNCS[vizIdx](0, 0, W, H, state.frame);
+    resetClip();
   } else {
     drawBackground();
   }
@@ -3518,7 +5511,11 @@ function drawMainDisc(src){
     vline(halfW, areaY, areaH, 1);
     const vizIdx = state.viz;
     if(vizIdx < VIZ_FUNCS.length-1 && VIZ_FUNCS[vizIdx]){
+      // 上下の UI バンド領域（STATUS_H / INFO_H）を除外して描画
+      // これがないと粒子などがステータスバー／インフォバーに上書きされる
+      setClip(halfW+1, areaY, W-halfW-1, areaH);
       VIZ_FUNCS[vizIdx](halfW+1, areaY, W-halfW-1, areaH, state.frame);
+      resetClip();
     }
   } else {
     // clock page
@@ -3992,26 +5989,309 @@ function drawClockScreen(){
   drawTextCenter(L('CURRENT TIME','現在時刻'), cx, 100, 1);
 }
 
-/* ---------------- TEST PATTERN ---------------- */
-function drawTest(){
-  clearFB(0);
-  const g = (state.frame*3)%40;
-  for(let y=0;y<H;y+=2){
-    for(let x=0;x<W;x+=2){
-      const v = (((x/2 + y/2 + g) | 0) % 4);
-      pset(x,y,v);
+/* ============================================================
+   OEL TEST PATTERN (RGB 直描画シーケンス)
+   ============================================================ */
+const TEST_PHASES = [
+  { name:'RED',          dur:3.0, kind:'solid', rgb:[255,  0,  0] },
+  { name:'GREEN',        dur:3.0, kind:'solid', rgb:[  0,255,  0] },
+  { name:'BLUE',         dur:3.0, kind:'solid', rgb:[  0,  0,255] },
+  { name:'WHITE',        dur:2.0, kind:'solid', rgb:[255,255,255] },
+  { name:'BLACK',        dur:2.0, kind:'solid', rgb:[  0,  0,  0] },
+  { name:'GRAYSCALE',    dur:3.0, kind:'gray' },
+  { name:'COLOR BARS',   dur:3.0, kind:'bars' },
+  { name:'RGB GRADIENT', dur:5.0, kind:'gradientRGB' },
+  { name:'HUE SWEEP',    dur:6.0, kind:'hue' },
+  { name:'H GRADIENT',   dur:4.0, kind:'gradH' },
+  { name:'V GRADIENT',   dur:4.0, kind:'gradV' },
+  { name:'NATIVE 480',   dur:5.0, kind:'nativeRamp' },   // 追加
+  { name:'PIXEL ZOOM',   dur:6.0, kind:'pixelZoom' },    // 追加
+  { name:'STEP WEDGE',   dur:4.0, kind:'stepWedge' },    // 追加
+  { name:'CHECKER',      dur:2.5, kind:'checker' },
+  { name:'CROSSHATCH',   dur:2.5, kind:'crosshatch' },
+  { name:'MOTION',       dur:4.0, kind:'motion' },
+  { name:'FADE',         dur:4.0, kind:'fade' },
+  { name:'DOT GRID',     dur:3.0, kind:'dots' },
+];
+
+let testRGB = null;
+function ensureTestRGB(){
+  if(!testRGB || testRGB.length !== PW*PH*3) testRGB = new Uint8Array(PW*PH*3);
+  return testRGB;
+}
+
+/* 1論理ドット = SCALE×SCALE の物理ピクセルを RGB で塗る */
+function testPixel(x, y, r, g, b){
+  x|=0; y|=0;
+  if(x<0||x>=W||y<0||y>=H) return;
+  const x0 = Math.floor(x*SCALE), x1 = Math.floor((x+1)*SCALE);
+  const y0 = Math.floor(y*SCALE), y1 = Math.floor((y+1)*SCALE);
+  for(let yy=y0; yy<y1; yy++){
+    const row = yy*PW;
+    for(let xx=x0; xx<x1; xx++){
+      const i = (row + xx)*3;
+      testRGB[i] = r; testRGB[i+1] = g; testRGB[i+2] = b;
     }
   }
-  for(let x=0;x<W;x+=40) vline(x,0,H,3);
-  for(let y=0;y<H;y+=20) hline(0,y,W,3);
-  rectOutline(0,0,W,H,3);
-  setClip(6,4,W-12,10);
-  fillRect(6,4,W-12,10,0);
-  drawText(L('OEL TEST PATTERN','OELテストパターン'), 8, 6, 3, 0);
-  resetClip();
-  drawText(L('VERSION 3.50','バージョン 3.50'), 4, H-11, 3, 0);
-  for(let i=0;i<12;i++){
-    fillRect(W-14, 6+i*9, 8, 8, i);
+}
+function testClear(r,g,b){
+  ensureTestRGB();
+  for(let i=0;i<PW*PH;i++){
+    const o = i*3;
+    testRGB[o] = r; testRGB[o+1] = g; testRGB[o+2] = b;
+  }
+}
+function testFillRect(x,y,w,h,r,g,b){
+  for(let j=0;j<h;j++) for(let i=0;i<w;i++) testPixel(x+i, y+j, r,g,b);
+}
+/* 5x7 FONT を RGB で描く（テスト画面用・日本語非対応でOK） */
+function testText(s, x, y, r, g, b){
+  s = String(s).toUpperCase();
+  let cx = x;
+  for(let n=0;n<s.length;n++){
+    const ch = s[n];
+    const g7 = FONT[ch] || FONT['?'];
+    for(let ry=0; ry<7; ry++){
+      const row = g7[ry];
+      if(!row) continue;
+      for(let bx=0; bx<5; bx++){
+        if(row & (1<<(4-bx))) testPixel(cx+bx, y+ry, r,g,b);
+      }
+    }
+    cx += 6;
+  }
+}
+/* HSV→RGB（0-360, 0-1, 0-1）*/
+function hsv2rgb(h, s, v){
+  h = ((h % 360) + 360) % 360;
+  const c = v * s;
+  const x = c * (1 - Math.abs(((h/60) % 2) - 1));
+  const m = v - c;
+  let r,g,b;
+  if(h <  60){ r=c; g=x; b=0; }
+  else if(h < 120){ r=x; g=c; b=0; }
+  else if(h < 180){ r=0; g=c; b=x; }
+  else if(h < 240){ r=0; g=x; b=c; }
+  else if(h < 300){ r=x; g=0; b=c; }
+  else            { r=c; g=0; b=x; }
+  return [Math.round((r+m)*255), Math.round((g+m)*255), Math.round((b+m)*255)];
+}
+
+function drawTest(){
+  ensureTestRGB();
+  const phase = TEST_PHASES[state.testPhase % TEST_PHASES.length];
+  const t = state.testT;
+  const f = state.frame;
+
+  switch(phase.kind){
+    case 'solid': {
+      testClear(phase.rgb[0], phase.rgb[1], phase.rgb[2]);
+      const lum = (phase.rgb[0]+phase.rgb[1]+phase.rgb[2])/3;
+      const tc = lum > 128 ? [0,0,0] : [255,255,255];
+      testText(phase.name, 4, 4, tc[0], tc[1], tc[2]);
+      const remain = Math.max(0, Math.ceil(phase.dur - t));
+      testText(String(remain), 4, H-14, tc[0], tc[1], tc[2]);
+      testFillRect(0,0,3,3, tc[0],tc[1],tc[2]);
+      testFillRect(W-3,0,3,3, tc[0],tc[1],tc[2]);
+      testFillRect(0,H-3,3,3, tc[0],tc[1],tc[2]);
+      testFillRect(W-3,H-3,3,3, tc[0],tc[1],tc[2]);
+      return;   // 進行バーは出さない（純色を汚さない）
+    }
+    case 'gray': {
+      const steps = 8, bw = W/steps;
+      for(let i=0;i<steps;i++){
+        const v = Math.round(255 * i/(steps-1));
+        testFillRect(Math.floor(i*bw), 0, Math.ceil(bw), H, v,v,v);
+      }
+      break;
+    }
+    case 'bars': {
+      const bars = [
+        [255,255,255],[255,255,0],[0,255,255],[0,255,0],
+        [255,0,255],[255,0,0],[0,0,255],[0,0,0]
+      ];
+      const bw = W/bars.length;
+      for(let i=0;i<bars.length;i++){
+        testFillRect(Math.floor(i*bw), 0, Math.ceil(bw), H, bars[i][0], bars[i][1], bars[i][2]);
+      }
+      break;
+    }
+    case 'gradientRGB': {
+      const shift = f*2;
+      for(let x=0;x<W;x++){
+        const h = ((x/W)*360 + shift) % 360;
+        const [r,g,b] = hsv2rgb(h, 1, 1);
+        testFillRect(x, 0, 1, H, r,g,b);
+      }
+      break;
+    }
+    case 'hue': {
+      const shift = f*3;
+      for(let y=0;y<H;y++){
+        const val = 1 - (y/H)*0.7;
+        for(let x=0;x<W;x++){
+          const h = ((x/W)*360 + shift) % 360;
+          const [r,g,b] = hsv2rgb(h, 1, val);
+          testPixel(x, y, r,g,b);
+        }
+      }
+      break;
+    }
+    case 'gradH': {
+      for(let x=0;x<W;x++){
+        const u = x/W;
+        let r,g,b;
+        if(u < 1/3){ const k=u*3; r=(1-k)*255; g=k*255; b=0; }
+        else if(u < 2/3){ const k=(u-1/3)*3; r=0; g=(1-k)*255; b=k*255; }
+        else { const k=(u-2/3)*3; r=k*255; g=0; b=(1-k)*255; }
+        testFillRect(x, 0, 1, H, r|0,g|0,b|0);
+      }
+      break;
+    }
+    case 'gradV': {
+      for(let y=0;y<H;y++){
+        const u = y/H;
+        let r,g,b;
+        if(u < 1/3){ const k=u*3; r=(1-k)*255; g=k*255; b=0; }
+        else if(u < 2/3){ const k=(u-1/3)*3; r=0; g=(1-k)*255; b=k*255; }
+        else { const k=(u-2/3)*3; r=k*255; g=0; b=(1-k)*255; }
+        testFillRect(0, y, W, 1, r|0,g|0,b|0);
+      }
+      break;
+    }
+    case 'nativeRamp': {
+      // 480段のグレースケールを 1論理ピクセルずつ描く。
+      // 8論理行ごとに位相を+1して、縦方向の解像度も同時に見えるようにする。
+      for(let y=0;y<H;y++){
+        const rowBlock = (y >> 3) & 7;
+        for(let x=0;x<W;x++){
+          const s = (x + rowBlock) % W;
+          const g = Math.round((s / (W-1)) * 255);
+          testPixel(x, y, g, g, g);
+        }
+      }
+      // 60論理ピクセルごとに目盛り（上端=青 / 下端=緑）
+      for(let k=0;k<=8;k++){
+        const gx = Math.min(W-1, Math.round(k * (W-1) / 8));
+        for(let y=0;y<3;y++)     testPixel(gx, y, 0, 0, 255);
+        for(let y=H-3;y<H;y++)   testPixel(gx, y, 0, 255, 0);
+      }
+      testText('NATIVE 480 x 120', 4, 4, 255, 255, 0);
+      break;
+    }
+    case 'pixelZoom': {
+      // 480x120 の論理ピクセルを 8x6 倍して"虫眼鏡"表示。
+      // 各論理ピクセルが 8x6 の単色ブロックとして見える。
+      const zoomX = 8, zoomY = 6;
+      const srcW = W / zoomX;   // 60
+      const srcH = H / zoomY;   // 20
+      // スクロール（ピンポン）
+      const range = W - srcW;                       // 420
+      const phase = (f * 1.2) % (range * 2);
+      const sx0 = phase < range ? phase : range * 2 - phase;
+
+      for(let j=0;j<srcH;j++){
+        for(let i=0;i<srcW;i++){
+          const sx = Math.floor(sx0) + i;
+          const h = (sx / W) * 360;
+          const v = 1 - (j / srcH) * 0.7;
+          const [r,g,b] = hsv2rgb(h, 1, v);
+          testFillRect(i*zoomX, j*zoomY, zoomX, zoomY, r, g, b);
+        }
+      }
+      testText('PIXEL ZOOM x' + zoomX + '  ORIG ' + srcW + 'x' + srcH, 4, 4, 255, 255, 0);
+      break;
+    }
+    case 'stepWedge': {
+      // 量子化ステップを並べてバンディングを可視化。
+      // 上段=グレー階調 / 下段=赤階調。
+      const counts = [8, 16, 32, 64, 128, 256];
+      const halfH = H >> 1;
+      const colW  = Math.floor(W / counts.length);
+      for(let i=0;i<counts.length;i++){
+        const n  = counts[i];
+        const bx = i * colW;
+        const bw = (i === counts.length-1) ? W - bx : colW;
+        for(let x=0;x<bw;x++){
+          const lv = Math.floor((x / bw) * n);
+          const v  = Math.round((lv / (n-1)) * 255);
+          for(let y=0;y<halfH;y++)  testPixel(bx+x, y, v, v, v);
+          for(let y=halfH;y<H;y++)  testPixel(bx+x, y, v, 0, 0);
+        }
+        testText(String(n), bx + 2, halfH - 10, 0, 255, 255);
+      }
+      // 中央の区切り線
+      for(let x=0;x<W;x++) testPixel(x, halfH, 255, 255, 0);
+      testText('STEP WEDGE', 4, 4, 255, 255, 0);
+      break;
+    }
+    case 'checker': {
+      for(let y=0;y<H;y++){
+        for(let x=0;x<W;x++){
+          const on = (x+y) & 1;
+          const v = on ? 255 : 0;
+          testPixel(x, y, v, v, v);
+        }
+      }
+      break;
+    }
+    case 'crosshatch': {
+      testClear(0,0,0);
+      for(let x=0;x<W;x+=10) testFillRect(x, 0, 1, H, 255,255,255);
+      for(let y=0;y<H;y+=10) testFillRect(0, y, W, 1, 255,255,255);
+      testFillRect(W/2-1, 0, 2, H, 255,0,0);
+      testFillRect(0, H/2-1, W, 2, 0,255,0);
+      testFillRect(0,0,W,1, 0,0,255);
+      testFillRect(0,H-1,W,1, 0,0,255);
+      testFillRect(0,0,1,H, 0,0,255);
+      testFillRect(W-1,0,1,H, 0,0,255);
+      break;
+    }
+    case 'motion': {
+      testClear(0,0,0);
+      const hx = Math.floor((f*8) % (W + 40)) - 20;
+      testFillRect(hx, H/2-8, 16, 16, 255,255,255);
+      for(let i=1;i<8;i++){
+        const tx = hx - i*20;
+        if(tx >= -16 && tx < W){
+          const v = Math.max(0, 255 - i*32);
+          testFillRect(tx, H/2-6, 12, 12, v, v, v);
+        }
+      }
+      testFillRect(0,0,4,4, 255,0,0);
+      testFillRect(W-4,0,4,4, 0,255,0);
+      testFillRect(0,H-4,4,4, 0,0,255);
+      testFillRect(W-4,H-4,4,4, 255,255,0);
+      break;
+    }
+    case 'fade': {
+      const tri = t < phase.dur/2
+        ? t/(phase.dur/2)
+        : 1 - (t - phase.dur/2)/(phase.dur/2);
+      const v = Math.round(tri*255);
+      testClear(v,v,v);
+      break;
+    }
+    case 'dots': {
+      testClear(0,0,0);
+      for(let y=4;y<H;y+=8){
+        for(let x=4;x<W;x+=8){
+          testFillRect(x, y, 2, 2, 255,255,255);
+        }
+      }
+      break;
+    }
+  }
+
+  // 進行状況インジケータ（下部）
+  const total = TEST_PHASES.length;
+  const barW = 6;
+  const bx = 4;
+  const by = H - 5;
+  testFillRect(bx-1, by-1, total*barW+1, 4, 0,0,0);
+  for(let i=0;i<total;i++){
+    if(i === state.testPhase) testFillRect(bx + i*barW, by, barW-1, 2, 255,255,255);
+    else                      testFillRect(bx + i*barW, by, barW-1, 2, 60,60,60);
   }
 }
 
@@ -4298,6 +6578,48 @@ const imgData  = ctx.createImageData(PW, PH);
 const gImgData = gctx.createImageData(PW, PH);
 
 function present(){
+  // ---- OEL TEST: メインは生RGB、グローは通常と同じパイプライン ----
+  if(state.phase === 'run' && state.screen === 'test'){
+    ensureTestRGB();
+    const d  = imgData.data;
+    const gd = gImgData.data;
+    const th = THEMES[state.theme % THEMES.length];
+    const pal = th.pal;
+    const N  = PW*PH;
+
+    for(let i=0;i<N;i++){
+      const s = i*3;
+      const r = testRGB[s], g = testRGB[s+1], b = testRGB[s+2];
+
+      // グロー残光バッファを通常時と同じロジックで更新
+      // （生RGBを「明るさ」相当のパレット値 0〜3 に正規化して蓄積）
+      const lum = ((r + g + b) / 765) * 3;
+      const gPrev = glowBuf[i] * 0.62;
+      glowBuf[i] = lum > gPrev ? lum : gPrev;
+
+      // メインCanvas：生RGB（純色を保つ）
+      const o = i*4;
+      d[o]   = r;
+      d[o+1] = g;
+      d[o+2] = b;
+      d[o+3] = 255;
+
+      // グローCanvas：通常時とまったく同じ写像
+      const gv   = glowBuf[i];
+      const gidx = Math.min(pal.length-1, Math.round(gv));
+      const gc   = pal[gidx];
+      const gk   = Math.min(1, gv/3);
+      gd[o]   = gc[0]*gk;
+      gd[o+1] = gc[1]*gk;
+      gd[o+2] = gc[2]*gk;
+      gd[o+3] = 255;
+    }
+
+    ctx.putImageData(imgData, 0, 0);
+    gctx.putImageData(gImgData, 0, 0);
+    return;
+  }
+
   const th = THEMES[state.theme % THEMES.length];
   const pal = th.pal;
   const bright = state.bright;
@@ -4354,8 +6676,18 @@ function syncClock(){
 
 function update(dt){
   state.frame++;
-  syncClock();          // 常に実時刻へ同期
 
+  syncClock();          // 常に実時刻へ同期
+  /* ---- ソース切替リングのタイマー・追従 ---- */
+  if(state.selT > 0){
+    state.selT -= dt;
+    const k = 1 - Math.exp(-9 * dt);          // 指数追従（連打でなめらかに）
+    state.selOffset += (state.selTarget - state.selOffset) * k;
+    if(state.selT <= 0){
+      state.selT = 0;
+      state.selOffset = state.selTarget;      // 終了時にスナップ
+    }
+  }
   // （残像は present() 内の glowBuf 減衰が自動で処理する）
 
   if(state.phase === 'boot'){
@@ -4401,6 +6733,25 @@ function update(dt){
   if(state.pageAnim > 0){
     state.pageAnim -= dt;
     if(state.pageAnim < 0) state.pageAnim = 0;
+  }
+
+  // ---- SERVICE スタブ / 自己診断の進行 ----
+  if(state.stubT > 0){
+    state.stubT -= dt;
+    if(state.stubT < 0) state.stubT = 0;
+  }
+  if(state.phase === 'run' && state.screen === 'diag' && state.diagStep < DIAG_ITEMS.length){
+    if(state.frame % 8 === 0) state.diagStep++;
+  }
+
+  // ---- OEL TEST のフェーズ送り ----
+  if(state.phase === 'run' && state.screen === 'test'){
+    state.testT += dt;
+    const _tp = TEST_PHASES[state.testPhase % TEST_PHASES.length];
+    if(state.testT >= _tp.dur){
+      state.testT = 0;
+      state.testPhase = (state.testPhase + 1) % TEST_PHASES.length;
+    }
   }
 
   if(state.phase === 'run' && state.screen === 'main' && state.demoOn){
@@ -4481,7 +6832,12 @@ function draw(){
     }
     return;
   }
-
+  /* ---- ソース切替アニメーション中は最優先でリングを表示 ---- */
+  if(state.selT > 0 && state.screen === 'main'){
+    drawSourceRing();
+    if(fadeT > 0) drawFadeOverlay();
+    return;
+  }
   switch(state.screen){
     case 'main':     drawMain(); break;
     case 'menu':     drawMenu(); break;
@@ -4490,6 +6846,29 @@ function draw(){
     case 'clock':    drawClockScreen(); break;
     case 'test':     drawTest(); break;
     case 'playlist': drawPlaylist(); break;
+    /* ---- SERVICE ---- */
+    case 'svctest': {
+      const t = SVC_TESTS[state.svcId];
+      if(t && t.draw) t.draw(state.frame);
+      else drawMain();
+      break;
+    }
+    case 'svcstub':  drawSvcStub(); break;
+    case 'diag':     drawDiag(); break;
+    case 'svcbtn':   drawBtnTest(); break;
+    case 'svcspk':   drawSpkTest(); break;
+    case 'svcsig':   drawSigGen(); break;
+    case 'svcdump':  drawSettingsDump(); break;
+    case 'svceeprom':drawEeprom(); break;
+    case 'svcerr':   drawErrorLog(); break;
+    case 'svcaud':   drawAudioMonitor(); break;
+    case 'svcplug':  drawPluginList(); break;
+    case 'custom': {
+      const sc = state.customScreen && engineScreens.get(state.customScreen.id);
+      if(sc && sc.draw){ try{ sc.draw(state.frame); }catch(e){ clearFB(0); drawTextCenter('PLUGIN ERR', W/2, 50, 4); } }
+      else drawMain();
+      break;
+    }
     default:         drawMain();
   }
   if(fadeT > 0) drawFadeOverlay();
@@ -4585,6 +6964,86 @@ function pressKey(k){
 
   if(state.phase !== 'run') return;
 
+  // ---- サービス実テスト中 ----
+  if(state.screen === 'svctest'){
+    if(k === 'BACK'){
+      if(svcEng.active && SVC_TESTS[svcEng.active] && SVC_TESTS[svcEng.active].stop){
+        try{ SVC_TESTS[svcEng.active].stop(); }catch(e){}
+      }
+      svcEng.stop();
+      svcEng.active = null;
+      fadeTransition(()=>{ state.screen='menu'; });
+      return;
+    }
+    const t = SVC_TESTS[state.svcId];
+    if(t && t.onKey) t.onKey(k);
+    return;
+  }
+
+  // ---- プラグインのカスタム画面がアクティブなら優先 ----
+  if(state.customScreen){
+    const sc = engineScreens.get(state.customScreen.id);
+    // プラグインのonKeyを先に呼ぶ
+    if(state._engineKeyHandlers){
+      for(const h of state._engineKeyHandlers){ try{ h(k); }catch(e){} }
+    }
+    if(sc && sc.onKey){ try{ sc.onKey(k); }catch(e){} }
+    // BACKで必ず戻れるセーフティ
+    if(k === 'BACK'){ state.customScreen = null; state.screen = 'menu'; }
+    return;
+  }
+
+  // ---- サービス系画面での個別処理 ----
+  if(state.screen === 'svcbtn'){
+    if(k === 'BACK'){ fadeTransition(()=>{ state.screen='menu'; }); return; }
+    btnTestLog.unshift(k);
+    if(btnTestLog.length > 20) btnTestLog.pop();
+    seNm3();
+    return;
+  }
+  if(state.screen === 'diag'){
+    if(k === 'BACK' || k === 'ENTER'){ fadeTransition(()=>{ state.screen='menu'; }); return; }
+    return;
+  }
+  if(state.screen === 'svcstub'){
+    if(state.stubT <= 0 || k === 'BACK' || k === 'ENTER'){ fadeTransition(()=>{ state.screen='menu'; }); }
+    return;
+  }
+  if(state.screen === 'svcspk'){
+    if(k === 'ENTER'){ spkTestStart((state.spkTestIdx+1) % SPK_CH.length); seNm3(); return; }
+    if(k === 'LEFT'){  spkTestStart((state.spkTestIdx-1+SPK_CH.length) % SPK_CH.length); seUp3(); return; }
+    if(k === 'RIGHT'){ spkTestStart((state.spkTestIdx+1) % SPK_CH.length); seUp3(); return; }
+    if(k === 'UP'){    spkTestStart((state.spkTestIdx-1+SPK_CH.length) % SPK_CH.length); seUp3(); return; }
+    if(k === 'DOWN'){  spkTestStart((state.spkTestIdx+1) % SPK_CH.length); seUp3(); return; }
+    if(k === 'BACK'){ spkTestStop(); fadeTransition(()=>{ state.screen='menu'; }); return; }
+    return;
+  }
+  if(state.screen === 'svcsig'){
+    if(k === 'UP'   && state.sigIdx > 0){ state.sigIdx--; sigStart(); seUp3(); return; }
+    if(k === 'DOWN' && state.sigIdx < SIG_LIST.length-1){ state.sigIdx++; sigStart(); seUp3(); return; }
+    if(k === 'LEFT'){  state.sigLR = (state.sigLR+2)%3; sigStart(); seDn3(); return; }
+    if(k === 'RIGHT'){ state.sigLR = (state.sigLR+1)%3; sigStart(); seUp3(); return; }
+    if(k === 'ENTER'){ state.sigLR = (state.sigLR+1)%3; sigStart(); seNm3(); return; }
+    if(k === 'BACK'){ sigStop(); fadeTransition(()=>{ state.screen='menu'; }); return; }
+    return;
+  }
+  if(state.screen === 'svcdump'){
+    if(k === 'UP'){ state.dumpScroll = Math.max(0, (state.dumpScroll|0)-1); seUp3(); return; }
+    if(k === 'DOWN'){ state.dumpScroll = (state.dumpScroll|0)+1; seDn3(); return; }
+    if(k === 'BACK'){ fadeTransition(()=>{ state.screen='menu'; }); return; }
+    return;
+  }
+  if(state.screen === 'svceeprom'){
+    if(k === 'UP'){ state.eepromScroll = Math.max(0, (state.eepromScroll|0)-1); seUp3(); return; }
+    if(k === 'DOWN'){ state.eepromScroll = (state.eepromScroll|0)+1; seDn3(); return; }
+    if(k === 'BACK'){ fadeTransition(()=>{ state.screen='menu'; }); return; }
+    return;
+  }
+  if(state.screen === 'svcerr' || state.screen === 'svcaud' || state.screen === 'svcplug'){
+    if(k === 'BACK'){ fadeTransition(()=>{ state.screen='menu'; }); return; }
+    return;
+  }
+
   // 確認ダイアログ中は ENTER/BACK/方向キーのみ受け付ける
   if(state.confirmDialog){
     if(k === 'ENTER'){ handleEnter(); return; }
@@ -4619,7 +7078,20 @@ function pressKey(k){
     case 'SOURCE': {
       const order = ['CD','MD','FM','AM','AUX'];
       const i = order.indexOf(state.source);
+      const prevSrc = state.source;
       state.source = order[(i+1)%order.length];
+
+      /* ---- リングアニメーション起動 ---- */
+      if(state.selT <= 0){
+        /* 待機中なら現在のソース位置にオフセットを同期 */
+        const curIdx = SRC_RING_LIST.indexOf(prevSrc);
+        state.selOffset = curIdx >= 0 ? curIdx : 0;
+        state.selTarget = state.selOffset;
+      }
+      /* 連打時は target だけ進めてタイマーを延長（連続回転） */
+      state.selTarget += 1;
+      state.selT = 1.0;             // ← 表示秒数（約1秒）
+
       if(state.source === 'CD' || state.source === 'MD'){
         state.tunerBand = 0;
         if(playlist.length && state.discIn){ playTrack(curTrack<0?0:curTrack); }
@@ -4792,20 +7264,42 @@ function handleEnter(){
   if(state.screen === 'eq'){       fadeTransition(()=>{ state.screen = 'menu'; }); return; }
   if(state.screen === 'position'){ fadeTransition(()=>{ state.screen = 'menu'; }); return; }
   if(state.screen === 'clock'){    fadeTransition(()=>{ state.screen = 'menu'; }); return; }
-  if(state.screen === 'test'){     fadeTransition(()=>{ state.screen = 'menu'; }); return; }
+  if(state.screen === 'test'){     state.screen = 'menu'; return; }   // ハードカット（純色→メニュー）
 
   if(state.screen === 'menu'){
     const m = curMenu();
     const it = m.items[state.menuIdx];
     if(!it) return;
+
+    // ---- VERSION連打でサービスモード ----
+    if(it.t === 'info'){
+      const v = it.dyn ? it.dyn() : it.val;
+      if(v && /FW/i.test(String(v))){
+        const now = performance.now();
+        if(now - state.lastTapT > 1500) state.versionTaps = 0;
+        state.lastTapT = now;
+        state.versionTaps++;
+        seNm3();
+        if(state.versionTaps >= 7){
+          state.versionTaps = 0;
+          seBt5();
+          fadeTransition(()=>{
+            state.stack = ['service'];
+            state.menuIdx = 0;
+            state.screen = 'menu';
+          });
+        }
+        return;
+      }
+    }
+
     if(it.t === 'sub'){ enterMenu(it.to); }
     else if(it.t === 'act'){ it.act(); }
     else if(it.t === 'sel'){
       const arr = it.opts;
-      state[it.key] = ((state[it.key]|0) + 1) % arr.length;   // 既にループ
+      state[it.key] = ((state[it.key]|0) + 1) % arr.length;
       applyMenuSideEffect(it);
     } else if(it.t === 'num'){
-      // 上限で最小値へループ
       let v = (state[it.key]|0) + it.step;
       if(v > it.max) v = it.min;
       state[it.key] = v;
@@ -4819,6 +7313,17 @@ function handleBack(){
   // (1) 確認ダイアログ表示中 → BACK は閉じるだけ
   if(state.confirmDialog){
     state.confirmDialog = null;
+    return;
+  }
+
+  // ---- サービス実テスト中 ----
+  if(state.screen === 'svctest'){
+    if(svcEng.active && SVC_TESTS[svcEng.active] && SVC_TESTS[svcEng.active].stop){
+      try{ SVC_TESTS[svcEng.active].stop(); }catch(e){}
+    }
+    svcEng.stop();
+    svcEng.active = null;
+    fadeTransition(function(){ state.screen = 'menu'; });
     return;
   }
 
@@ -4872,11 +7377,20 @@ function handleBack(){
   }
 
   // (4) その他画面
-  if(state.screen === 'eq' || state.screen === 'position' || state.screen === 'test'){
+  if(state.screen === 'eq' || state.screen === 'position'){
     fadeTransition(function(){ state.screen = 'menu'; });
     return;
   }
+  if(state.screen === 'test'){ state.screen = 'menu'; return; }
   if(state.screen === 'clock'){ fadeTransition(function(){ state.screen = 'menu'; }); return; }
+  // サービス系はすべてメニューへ戻す（音を止める）
+  if(state.screen === 'svcspk'){ spkTestStop(); }
+  if(state.screen === 'svcsig'){ sigStop(); }
+  if(state.screen === 'custom'){ state.customScreen = null; }
+  if(state.screen && state.screen.indexOf('svc') === 0 || state.screen === 'diag'){
+    fadeTransition(function(){ state.screen = 'menu'; });
+    return;
+  }
   if(state.screen === 'menu'){ menuBack(); }
 }
 
@@ -4960,6 +7474,20 @@ function handleDirection(k){
       if(h === 1) enterMenu(it.to);
     }
     scheduleSave();
+    return;
+  }
+
+  if(state.screen === 'test'){
+    if(h !== 0){
+      state.testT = 0;
+      state.testPhase = (state.testPhase + h + TEST_PHASES.length) % TEST_PHASES.length;
+      seUp3();
+    }
+    if(d !== 0){
+      state.testT = 0;
+      state.testPhase = (state.testPhase + d + TEST_PHASES.length) % TEST_PHASES.length;
+      seUp3();
+    }
     return;
   }
 
