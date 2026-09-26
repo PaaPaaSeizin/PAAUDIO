@@ -1185,8 +1185,26 @@ async function parseID3(file){
   try{
     if(file.size < 12) return empty;
     const head = await readSlice(file, 0, 12);
-    // ID3v2 (MP3)
-    if(head[0]===0x49 && head[1]===0x44 && head[2]===0x33) return parseID3v2(file);
+    // ID3v2 (MP3)  ← Opus の先頭に ID3v2 が付いている場合もここに来る
+    if(head[0]===0x49 && head[1]===0x44 && head[2]===0x33){
+      // MP3 として解釈。ただし画像が取れなければ Ogg フォールバックを試す
+      return parseID3v2(file).then(res=>{
+        if(res && res.picture) return res;
+        // 拡張子が Ogg 系なら Ogg も試す
+        if(/\.(opus|ogg|oga|weba)$/i.test(file.name)){
+          return parseOgg(file).then(r=>{
+            // 得られたフィールドを合成
+            return {
+              title:  res.title  || r.title,
+              artist: res.artist || r.artist,
+              album:  res.album  || r.album,
+              picture: r.picture || res.picture,
+            };
+          });
+        }
+        return res;
+      });
+    }
     // FLAC
     if(head[0]===0x66 && head[1]===0x4C && head[2]===0x61 && head[3]===0x43) return parseFlac(file);
     // OGG (Vorbis / Opus)
@@ -1197,6 +1215,10 @@ async function parseID3(file){
     if(head[0]===0x52 && head[1]===0x49 && head[2]===0x46 && head[3]===0x46 &&
        head[8]===0x57 && head[9]===0x41 && head[10]===0x56 && head[11]===0x45){
       return parseWAV(file);
+    }
+    // 上記いずれにも該当しないが Ogg 系拡張子 → Ogg を試す
+    if(/\.(opus|ogg|oga|weba)$/i.test(file.name)){
+      return parseOgg(file);
     }
   }catch(e){}
   return empty;
@@ -1230,11 +1252,27 @@ async function parseWAV(file){
 /* OGG ページを走査してメタデータパケット（OpusTags / Vorbis comment）を再構成する。
    ※大きなカバー画像はパケットが複数ページにまたがるため、
       バッファ内を単純検索するとページヘッダが混入して壊れる。 */
-function findOggMetadataPacket(buf){
-  let p = 0;
+/* OGG ページを走査してメタデータパケットを全て収集する。
+   - 先頭が OggS でない（ID3v2 前置など）場合でも、最初の OggS を探して開始
+   - ページ境界を正しく処理してパケットを再構成
+   - OpusTags / Vorbis comment の両方に対応 */
+function collectOggMetadataPackets(buf){
+  const out = [];
+
+  // 最初の OggS マジックをバッファ前方 256KB 以内で探す
+  let start = -1;
+  const scanLimit = Math.min(buf.length - 4, 256 * 1024);
+  for(let i=0; i<scanLimit; i++){
+    if(buf[i]===0x4F && buf[i+1]===0x67 && buf[i+2]===0x67 && buf[i+3]===0x53){
+      start = i; break;
+    }
+  }
+  if(start < 0) return out;
+
+  let p = start;
   let currentPacket = [];
   let pageCount = 0;
-  while(p + 27 <= buf.length && pageCount < 64){
+  while(p + 27 <= buf.length && pageCount < 512){
     if(buf[p] !== 0x4F || buf[p+1] !== 0x67 || buf[p+2] !== 0x67 || buf[p+3] !== 0x53) break;
     const headerType = buf[p+5];
     const pageSegs   = buf[p+26];
@@ -1248,25 +1286,25 @@ function findOggMetadataPacket(buf){
     let segPos = segTable;
     while(segPos < segTable + pageSegs){
       const segSize = buf[segPos];
-      for(let i=0;i<segSize;i++){
-        if(dataOff + i < buf.length) currentPacket.push(buf[dataOff + i]);
-      }
-      dataOff += segSize;
+      const end    = dataOff + segSize;
+      const capEnd = Math.min(end, buf.length);
+      for(let i=dataOff; i<capEnd; i++) currentPacket.push(buf[i]);
+      dataOff = end;
       segPos++;
       if(segSize < 255){
         // パケット終端
-        const pkt = new Uint8Array(currentPacket);
+        const pkt = currentPacket.length ? new Uint8Array(currentPacket) : new Uint8Array(0);
         // OpusTags
         if(pkt.length >= 8 &&
            pkt[0]===0x4F && pkt[1]===0x70 && pkt[2]===0x75 && pkt[3]===0x73 &&
            pkt[4]===0x54 && pkt[5]===0x61 && pkt[6]===0x67 && pkt[7]===0x73){
-          return { tags: pkt, hdrLen: 8 };
+          out.push({ tags: pkt, hdrLen: 8 });
         }
-        // Vorbis comment header (0x03 + "vorbis")
-        if(pkt.length >= 7 &&
+        // Vorbis comment header (0x03 'vorbis')
+        else if(pkt.length >= 7 &&
            pkt[0]===0x03 && pkt[1]===0x76 && pkt[2]===0x6F && pkt[3]===0x72 &&
            pkt[4]===0x62 && pkt[5]===0x69 && pkt[6]===0x73){
-          return { tags: pkt, hdrLen: 7 };
+          out.push({ tags: pkt, hdrLen: 7 });
         }
         currentPacket = [];
       }
@@ -1274,67 +1312,78 @@ function findOggMetadataPacket(buf){
     p = dataOff;
     pageCount++;
   }
-  return null;
+  return out;
+}
+
+/* base64 をバイト列に変換（URL-safe とパディング欠けに対応） */
+function base64ToBytes(b64){
+  try{
+    let s = String(b64).replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/');
+    const pad = s.length % 4;
+    if(pad === 2) s += '==';
+    else if(pad === 3) s += '=';
+    else if(pad === 1) return null;   // 不正長
+    const raw = atob(s);
+    const bin = new Uint8Array(raw.length);
+    for(let j=0;j<raw.length;j++) bin[j] = raw.charCodeAt(j);
+    return bin;
+  }catch(e){ return null; }
 }
 
 async function parseOgg(file){
   const result = { title:null, artist:null, album:null, picture:null };
   try{
-    // ページ再構成で断片化されるため、余裕を持って 8MB まで読む
-    const cap = Math.min(file.size, 8 * 1024 * 1024);
+    // 巨大カバー対応のため 16MB まで読む
+    const cap = Math.min(file.size, 16 * 1024 * 1024);
     const buf = await readSlice(file, 0, cap);
 
-    const found = findOggMetadataPacket(buf);
-    if(!found) return result;
-    const tags = found.tags;
-    let p = found.hdrLen;
+    // 全 OpusTags / Vorbis-comment パケットを収集
+    const packets = collectOggMetadataPackets(buf);
+    if(!packets.length) return result;
 
-    const dv = new DataView(tags.buffer, tags.byteOffset, tags.byteLength);
-    if(p + 4 > tags.length) return result;
-    const vlen = dv.getUint32(p, true); p += 4;
-    p += vlen;                                  // vendor string
-    if(p + 4 > tags.length) return result;
-    const count = dv.getUint32(p, true); p += 4;
     const dec = new TextDecoder('utf-8');
     let coverartMime = null;
-    for(let i=0;i<count && p+4 <= tags.length;i++){
-      const len = dv.getUint32(p, true); p += 4;
-      if(len <= 0 || p+len > tags.length) break;
-      const s = dec.decode(tags.subarray(p, p+len));
-      p += len;
-      const eq = s.indexOf('=');
-      if(eq < 0) continue;
-      const key = s.slice(0, eq).toUpperCase();
-      const val = s.slice(eq+1).trim();
-      if(!val) continue;
-      if(key === 'TITLE' && !result.title) result.title = val;
-      else if(key === 'ARTIST' && !result.artist) result.artist = val;
-      else if(key === 'ALBUM' && !result.album) result.album = val;
-      else if(key === 'METADATA_BLOCK_PICTURE' && !result.picture){
-        try{
-          const clean = val.replace(/\s+/g, '');
-          const raw = atob(clean);
-          const bin = new Uint8Array(raw.length);
-          for(let j=0;j<raw.length;j++) bin[j] = raw.charCodeAt(j);
-          const pic = parseFlacPicture(bin);
-          if(pic) result.picture = pic;
-        }catch(e){}
-      }
-      else if(key === 'COVERART' && !result.picture){
-        // 旧形式（非推奨だが一部エンコーダが出力）
-        try{
-          const clean = val.replace(/\s+/g, '');
-          const raw = atob(clean);
-          const bin = new Uint8Array(raw.length);
-          for(let j=0;j<raw.length;j++) bin[j] = raw.charCodeAt(j);
-          result.picture = { mime: detectImageMime(bin, 'image/jpeg'), data: bin };
-        }catch(e){}
-      }
-      else if(key === 'COVERARTMIME'){
-        coverartMime = val;
-      }
+    for(const {tags, hdrLen} of packets){
+      try{
+        let p = hdrLen;
+        const dv = new DataView(tags.buffer, tags.byteOffset, tags.byteLength);
+        if(p + 4 > tags.length) continue;
+        const vlen = dv.getUint32(p, true); p += 4;
+        p += vlen;
+        if(p + 4 > tags.length) continue;
+        const count = dv.getUint32(p, true); p += 4;
+        for(let i=0;i<count && p+4 <= tags.length;i++){
+          const len = dv.getUint32(p, true); p += 4;
+          if(len <= 0 || p+len > tags.length) break;
+          const s = dec.decode(tags.subarray(p, p+len));
+          p += len;
+          const eq = s.indexOf('=');
+          if(eq < 0) continue;
+          const key = s.slice(0, eq).toUpperCase();
+          const val = s.slice(eq+1).trim();
+          if(!val) continue;
+          if(key === 'TITLE' && !result.title) result.title = val;
+          else if(key === 'ARTIST' && !result.artist) result.artist = val;
+          else if(key === 'ALBUM' && !result.album) result.album = val;
+          else if(key === 'METADATA_BLOCK_PICTURE' && !result.picture){
+            const bin = base64ToBytes(val);
+            if(bin){
+              const pic = parseFlacPicture(bin);
+              if(pic) result.picture = pic;
+            }
+          }
+          else if(key === 'COVERART' && !result.picture){
+            const bin = base64ToBytes(val);
+            if(bin) result.picture = { mime: detectImageMime(bin, 'image/jpeg'), data: bin };
+          }
+          else if(key === 'COVERARTMIME'){
+            coverartMime = val;
+          }
+        }
+      }catch(e){}
+      if(result.picture) break;   // 見つかったら以降のパケットは見ない
     }
-    // COVERART 使用時に MIME を補正
+    // COVERART 使用時に MIME を確定
     if(result.picture && coverartMime){
       result.picture.mime = detectImageMime(result.picture.data, coverartMime);
     }
