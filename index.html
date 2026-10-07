@@ -493,6 +493,16 @@ function isASCII(ch){
   return ch.charCodeAt(0) < 128;
 }
 
+/* 全角英数記号を半角へ正規化（文字化け防止） */
+function normCh(ch){
+  const c = ch.charCodeAt(0);
+  // 全角ASCII（！〜～ U+FF01..U+FF5E）→ 半角（!〜~ U+0021..U+007E）
+  if(c >= 0xFF01 && c <= 0xFF5E) return String.fromCharCode(c - 0xFEE0);
+  // 全角スペース → 半角スペース
+  if(c === 0x3000) return ' ';
+  return ch;
+}
+
 /* ==========================================================================
    2. DISPLAY BUFFER  (論理 480x120 / 物理 720x180)
    ========================================================================== */
@@ -616,6 +626,7 @@ function spc(sp){
 /* text width */
 function charW(ch, sp){
   sp = spc(sp);
+  ch = normCh(ch);                       // ← 追加
   if(FONT[ch.toUpperCase()]) return 5+sp;
   if(isASCII(ch)) return 5+sp;
   return CJK_W+sp;
@@ -628,13 +639,15 @@ function tw(s, sp){
   return Math.max(0, w - sp);
 }
 
+
 function drawText(s, x, y, c, sp){
   sp = spc(sp);
   s = String(s);
   let cx = x;
   for(let n=0;n<s.length;n++){
-    const ch = s[n];
+    const ch = normCh(s[n]);             // ← s[n] から変更
     const up = ch.toUpperCase();
+    /* 以下は既存のまま */
     if(FONT[up]){
       const g = FONT[up];
       for(let r=0;r<7;r++){
@@ -669,8 +682,9 @@ function drawTextBig(s, x, y, c, sc, sp){
   s = String(s);
   let cx = x;
   for(let n=0;n<s.length;n++){
-    const ch = s[n];
+    const ch = normCh(s[n]);             // ← s[n] から変更
     const up = ch.toUpperCase();
+    /* 以下は既存のまま */
     if(FONT[up] || isASCII(ch)){
       const g = FONT[up] || FONT['?'];
       for(let r=0;r<7;r++){
@@ -700,8 +714,9 @@ function drawTextPset(s, x, y, c, sp){
   s = String(s);
   let cx = x;
   for(let n=0;n<s.length;n++){
-    const ch = s[n];
+    const ch = normCh(s[n]);             // ← s[n] から変更
     const up = ch.toUpperCase();
+    /* 以下は既存のまま */
     if(FONT[up]){
       const g = FONT[up];
       for(let r=0;r<7;r++){
@@ -1105,6 +1120,51 @@ function readSlice(file, start, end){
     fr.readAsArrayBuffer(file.slice(start, end));
   });
 }
+/* encoding byte 0 用：UTF-8 → Shift_JIS → Latin-1 を順に試す */
+function decodeUnknownEnc(data){
+  // 末尾の 0 埋めを除く
+  let len = data.length;
+  while(len > 0 && data[len-1] === 0) len--;
+  if(len === 0) return '';
+  const slice = data.subarray(0, len);
+
+  // (A) 1バイトおきに 0 が並ぶ → UTF-16 の疑い
+  //     （encoding 0 なのに UTF-16 が入っている例への保険）
+  if(len >= 4 && (len & 1) === 0){
+    let zerosOdd = 0, zerosEven = 0;
+    const n = Math.min(len, 40);
+    for(let i=1;i<n;i+=2) if(slice[i]===0) zerosOdd++;
+    for(let i=0;i<n;i+=2) if(slice[i]===0) zerosEven++;
+    const half = Math.max(1, n>>1);
+    if(zerosOdd >= half * 0.7){
+      let s = '';
+      for(let i=0;i+1<len;i+=2) s += String.fromCharCode(slice[i] | slice[i+1]<<8);
+      return s;
+    }
+    if(zerosEven >= half * 0.7){
+      let s = '';
+      for(let i=0;i+1<len;i+=2) s += String.fromCharCode(slice[i]<<8 | slice[i+1]);
+      return s;
+    }
+  }
+
+  // (B) UTF-8 として厳密デコードできるか？
+  try{
+    return new TextDecoder('utf-8', { fatal:true }).decode(slice);
+  }catch(e){}
+
+  // (C) Shift_JIS（Windows-31J）。置換文字 \uFFFD が出なければ採用
+  try{
+    const s = new TextDecoder('shift-jis').decode(slice);
+    if(s.indexOf('\uFFFD') < 0) return s;
+  }catch(e){}
+
+  // (D) 最終フォールバック：Latin-1
+  let out = '';
+  for(let i=0;i<len;i++) out += String.fromCharCode(slice[i]);
+  return out;
+}
+
 function decodeTextFrame(buf, start, end){
   if(end-start < 1) return null;
   const enc = buf[start];
@@ -1112,17 +1172,24 @@ function decodeTextFrame(buf, start, end){
   let str = '';
   try{
     if(enc === 0){
-      for(let i=0;i<data.length;i++) if(data[i]) str += String.fromCharCode(data[i]);
-    } else if(enc === 1 || enc === 2){
-      // UTF-16 (with or without BOM)
-      let arr = data;
+      str = decodeUnknownEnc(data);                       // ← 変更点はここだけ
+    } else if(enc === 1){
+      // UTF-16 with BOM（BOM 無しは LE と仮定）
       let off = 0;
-      if(data.length >= 2 && ((data[0]===0xFF && data[1]===0xFE) || (data[0]===0xFE && data[1]===0xFF))){
+      if(data.length >= 2 &&
+         ((data[0]===0xFF && data[1]===0xFE) ||
+          (data[0]===0xFE && data[1]===0xFF))){
         off = 2;
       }
-      const le = (data[0]===0xFF && data[1]===0xFE);
-      for(let i=off; i+1<arr.length; i+=2){
-        const code = le ? (arr[i] | arr[i+1]<<8) : (arr[i]<<8 | arr[i+1]);
+      const le = !(data.length >= 2 && data[0]===0xFE && data[1]===0xFF);
+      for(let i=off; i+1<data.length; i+=2){
+        const code = le ? (data[i] | data[i+1]<<8) : (data[i]<<8 | data[i+1]);
+        if(code) str += String.fromCharCode(code);
+      }
+    } else if(enc === 2){
+      // UTF-16BE without BOM
+      for(let i=0; i+1<data.length; i+=2){
+        const code = (data[i]<<8 | data[i+1]);
         if(code) str += String.fromCharCode(code);
       }
     } else if(enc === 3){
