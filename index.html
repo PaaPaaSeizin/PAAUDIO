@@ -334,6 +334,10 @@
           LOAD FILES
           <input type="file" id="fileIn" multiple accept="audio/*,.mp3,.wav,.ogg,.m4a,.aac,.flac,.opus">
         </label>
+        <label class="fileLbl">
+          LOAD FOLDER
+          <input type="file" id="folderIn" webkitdirectory directory multiple>
+        </label>
         <span class="mini" id="fileCount">0 TRK</span>
       </div>
     </div>
@@ -7784,6 +7788,25 @@ const fileIn = document.getElementById('fileIn');
 fileIn.addEventListener('change', (e)=>{
   if(e.target.files && e.target.files.length){
     loadFiles(e.target.files);
+    initAudio();
+    if(actx && actx.state === 'suspended') actx.resume();
+    if(state.power && state.discIn && (state.source==='CD' || state.source==='MD')){
+      playTrack(0);
+    }
+  }
+});
+
+/* ---- LOAD FOLDER：フォルダごとアップロード ---- */
+const folderIn = document.getElementById('folderIn');
+folderIn.addEventListener('change', (e)=>{
+  if(e.target.files && e.target.files.length){
+    // パス順（サブフォルダ含む）に並べ替えて再生順を安定させる
+    const files = Array.from(e.target.files).sort((a,b)=>{
+      const pa = a.webkitRelativePath || a.name;
+      const pb = b.webkitRelativePath || b.name;
+      return pa.localeCompare(pb, undefined, { numeric:true });
+    });
+    loadFiles(files);
     initAudio();
     if(actx && actx.state === 'suspended') actx.resume();
     if(state.power && state.discIn && (state.source==='CD' || state.source==='MD')){
