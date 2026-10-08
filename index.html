@@ -1110,7 +1110,9 @@ audioEl.addEventListener('pause', ()=>{ isPlaying = false; });
 // アルバムアート用パレットインデックス（暗→明の4段階）
 // パレットの 1,2,3,4 番（テーマの暗色〜明色）を使う
 // 0=消灯、1〜8=パレットの暗色〜明色（8段階）
-const ART_LEVELS = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+// アルバムアート用パレット階調（テーマ 0-3 = 暗→明のベースランプのみ）
+// 4〜11番はアクセント色（赤/緑/黄…）なので使わない
+const ART_LEVELS = [0, 1, 2, 3];
 
 function readSlice(file, start, end){
   return new Promise((res, rej)=>{
@@ -1825,11 +1827,13 @@ function imageToMonoArt(img, size){
 
 function getAlbumArt(track){
   if(!track) return null;
-  if(track.art) return track.art;           // 埋め込み画像が抽出済みならそれを使う
-  if(!track.id3Loaded) return null;          // パース完了まで模様を出さない
-  if(!track._procArt){                       // パース完了して画像が無かった場合のみ模様
-    const seed = hashStr((track.artist||'') + '|' + (track.album||'') + '|' + (track.title||''));
-    track._procArt = generateProceduralArt(seed, 48);
+  if(track.art) return track.art;
+  if(!track.id3Loaded) return null;
+  if(!track._procArt){
+    const seed = hashStr(
+      (track.artist||'') + '|' + (track.album||'') + '|' + (track.title||'')
+    );
+    track._procArt = generateProceduralArt(seed, 128);   // ← 48 から 128 へ
   }
   return track._procArt;
 }
@@ -1930,14 +1934,12 @@ function detectImageMime(data, hint){
     return 'image/webp';
   }
   return hint || 'image/jpeg';
-}
-/* アルバムアートを targetSize にエリア平均＋ベイヤーディザで描画 */
-function drawArtDither(art, ax, ay, targetSize){
+}function drawArtDither(art, ax, ay, targetSize){
   if(!art) return;
   const srcW = art.w, srcH = art.h;
   const scaleX = srcW / targetSize;
   const scaleY = srcH / targetSize;
-  const LEVELS = ART_LEVELS.length - 1;   // 8
+  const N = ART_LEVELS.length;            // 4
 
   for(let j=0;j<targetSize;j++){
     const sy0 = Math.floor(j * scaleY);
@@ -1963,14 +1965,14 @@ function drawArtDither(art, ax, ay, targetSize){
       const lum = (cnt ? sum/cnt : 0) / 255;   // 0〜1
 
       // ベイヤー 4x4 でディザ → パレット階調へ
-      const threshold = (BAYER_4[j%4][i%4] + 0.5) / 16;
-      const dithered = lum + (threshold - 0.5) * 0.35;
-      let level = Math.floor(dithered * LEVELS);
-      if(dithered >= 1) level = LEVELS;
-      if(level < 0) level = 0;
+      // bayer は 0〜15/16 の一様値。lum*(N-1) に加算して floor することで
+      // 各量子化ステップがディザで正しく平均化される
+      const bayer = BAYER_4[j%4][i%4] / 16;
+      let level = Math.floor(lum * (N - 1) + bayer);
+      if(level >= N) level = N - 1;
+      if(level < 0)  level = 0;
 
-      const v = level === 0 ? 0 : ART_LEVELS[level];
-      pset(ax+i, ay+j, v);
+      pset(ax+i, ay+j, ART_LEVELS[level]);
     }
   }
 }
@@ -5231,21 +5233,46 @@ function drawSourceRing(){
 /* 画面遷移：そのまま切り替える（残像は glowBuf の自然減衰が担当） */
 let fadeSnap = null;
 let fadeT = 0;
+const FADE_DUR = 0.18;             // ← この1行を追加
+
 function fadeTransition(fn){
-  fadeSnap = new Uint8Array(fb);   // 現在の画面をスナップショット
-  fadeT = 0.30;
-  fn();                            // 先に新画面へ切替（内部状態のみ）
+  fadeSnap = new Uint8Array(fb);
+  fadeT = FADE_DUR;                // ← 定数に置き換え
+  fn();
 }
+
 function drawFadeOverlay(){
   if(fadeT <= 0 || !fadeSnap) return;
-  const p = 1 - fadeT/0.30;
+
+  const p = 1 - fadeT/FADE_DUR;    // 0 → 1
   const fadeK = 1 - p;             // 1 → 0
+
   const N = fb.length;
   for(let i=0;i<N;i++){
-    const oldV = (fadeSnap[i] * fadeK) | 0;
-    if(oldV > fb[i]) fb[i] = oldV; // 旧画面を薄く重ねる
+    const oldV = fadeSnap[i];
+    if(oldV === 0) continue;
+
+    const target = oldV * fadeK;
+    let v;
+
+    if(target >= 1){
+      // 1以上：普通に丸める（下限 1 を保証）
+      v = Math.round(target);
+      if(v < 1) v = 1;
+    } else {
+      // 1未満：Bayer ディザで 0/1 の密度を確率的に表現
+      // → level 1 が「1 に張り付く」ことなく、なめらかに薄れて消える
+      const bx = i % PW;
+      const by = (i / PW) | 0;
+      const bayer = (BAYER_4[by & 3][bx & 3] + 0.5) / 16;
+      v = (target > bayer) ? 1 : 0;
+    }
+
+    if(v > fb[i]) fb[i] = v;
   }
-  if(p >= 1) fadeSnap = null;
+
+  // 終わり際の一斉消滅はもう不要（自然に 0 になる）→ 完全に消えたら破棄
+  if(fadeK <= 0.01) fadeSnap = null;
 }
 
 const JP_OPTS = {
